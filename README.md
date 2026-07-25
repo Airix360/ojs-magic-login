@@ -2,7 +2,7 @@
 
 <table>
 <tr>
-<td><strong>Version</strong></td><td>1.2.1</td>
+<td><strong>Version</strong></td><td>1.3.0</td>
 <td><strong>OJS</strong></td><td>3.5.0+</td>
 <td><strong>PHP</strong></td><td>8.1+</td>
 <td><strong>License</strong></td><td>GPL-3.0-or-later</td>
@@ -13,6 +13,8 @@
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/thathman)
 
 Passwordless sign-in for Open Journal Systems 3.5. Users receive a one-time link by email and sign in with a single click — no password required. Works alongside the standard login; neither flow replaces the other.
+
+As of 1.3.0, users can *also* enable sign-in via a 6-digit authenticator-app code (TOTP, RFC 6238) as a second alternative sign-in method — entirely optional, per-account, and independent of the magic-link flow (not a combined two-factor requirement). See [TOTP alternative sign-in](#totp-alternative-sign-in) below.
 
 ---
 
@@ -166,6 +168,22 @@ User clicks Sign in      POST /magicLogin/login
 | Account enumeration | Send endpoint returns identical response for matched and unmatched emails |
 | CSRF | OJS built-in CSRF token enforced unconditionally on every mutating endpoint, including requests from an already-logged-in session (prevents login-CSRF) |
 | Core changes | None — the plugin is entirely hook-based |
+
+---
+
+## TOTP alternative sign-in
+
+Starting in 1.3.0, a signed-in user can enable authenticator-app (TOTP, RFC 6238) sign-in on their own account at `magicLogin/totpSetup` (also linked from their profile page). Once enabled, the sign-in page's "Email me a sign-in link" flow gains a sibling option, "Sign in with an authenticator code instead" (`magicLogin/totp`), where the user enters their username/email plus the current 6-digit code. **This is an alternative, not a combined second factor** — a user can sign in with either method; TOTP is never required in addition to the magic link. Combining them into mandatory 2FA was considered and rejected: this plugin's whole premise is reducing login friction, and silently turning every TOTP-enrolled account into "must always also enter a code" would be a bigger behavioural change than "add an alternative method," which is what was asked for.
+
+Implementation notes and judgement calls:
+
+- **No TOTP library existed anywhere in this installation's vendor tree** (checked `lib/pkp/lib/vendor` and both `composer.lock` files) — RFC 6238 was implemented directly on top of PHP's built-in `hash_hmac('sha1', ...)`, in `classes/TotpService.php`. Verified against the published RFC 4226 Appendix D test vectors (see `tests/totp-format.php`).
+- **No QR code image is rendered.** Drawing a scannable QR code from scratch (module matrix layout + Reed-Solomon error correction) is significant, error-prone complexity for a plugin whose entire selling point is zero new dependencies — and getting the ECC wrong produces QR codes that *look* fine but don't scan, which is worse than not offering one. Instead, the setup page shows a tappable `otpauth://` URI (opens directly in an authenticator app when visited on the same device) and the raw base32 secret for manual entry — every authenticator app supports typing in a secret manually.
+- **Secrets are encrypted at rest** using `classes/SecretCipher.php`, ported from the sibling PaystackOJS plugin's at-rest encryption pattern (libsodium secretbox, falling back to AES-256-GCM — both built into PHP). The key is derived from `config.inc.php`'s existing `[security] api_key_secret` / `salt`, never stored alongside the ciphertext.
+- **Setup requires confirmation**: a newly generated secret is "pending" until the user proves possession by entering one valid code; it expires after 10 minutes if never confirmed.
+- **Login-code replay is blocked**: the time-step a code matched is persisted per-account, and a code resolving to an already-consumed (or earlier) step is rejected — without this, a code would stay valid for reuse across its whole ±30s tolerance window.
+- **Disabling TOTP requires re-entering the account password** — an active session alone is not sufficient authority to turn off a security feature.
+- **Rate limiting**: verify attempts on `magicLogin/totpLogin` are throttled both per-IP (10/5 min) and per-account (8/15 min, independent of IP) — a 6-digit code has far less entropy than the magic-link token and needs brute-force resistance from both angles, reusing this plugin's existing sliding-window rate-limit pattern.
 
 ---
 

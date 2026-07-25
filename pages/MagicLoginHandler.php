@@ -34,6 +34,7 @@ use APP\facades\Repo;
 use APP\handler\Handler;
 use APP\plugins\generic\magicLogin\classes\SessionService;
 use APP\plugins\generic\magicLogin\classes\TokenService;
+use APP\plugins\generic\magicLogin\classes\TotpAccountService;
 use APP\plugins\generic\magicLogin\mailables\MagicLoginLink;
 use APP\plugins\generic\magicLogin\MagicLoginPlugin;
 use APP\template\TemplateManager;
@@ -56,6 +57,19 @@ class MagicLoginHandler extends Handler
     private const RL_SEND_WIN  = 600; // 10 minutes
     private const RL_LOGIN_MAX = 10;  // max /login POST attempts per IP per window
     private const RL_LOGIN_WIN = 300; // 5 minutes
+
+    // TOTP (authenticator-app code) alternative sign-in — per-IP AND
+    // per-account limits, since a 6-digit code has far less entropy than the
+    // magic-link token and must be brute-force resistant from both angles.
+    private const RL_TOTP_IP_MAX      = 10;  // max /totpLogin POST attempts per IP per window
+    private const RL_TOTP_IP_WIN      = 300; // 5 minutes
+    private const RL_TOTP_ACCOUNT_MAX = 8;   // max attempts per *account* per window, any IP
+    private const RL_TOTP_ACCOUNT_WIN = 900; // 15 minutes
+
+    /** Identifier field on the TOTP alt-login form: username or email. */
+    private const TOTP_IDENTIFIER_MAX_LEN = 254;
+    /** 6-digit authenticator code. */
+    private const TOTP_CODE_PATTERN = '/^\d{6}$/';
 
     // Minimum wall-clock duration (seconds) the email-lookup branch of /send
     // must take before responding, so a matched email (DB writes + a
@@ -254,6 +268,209 @@ class MagicLoginHandler extends Handler
         $request->redirect(null, 'magicLogin', 'request');
     }
 
+    // ── TOTP: alternative sign-in (authenticator-app code) ───────────────────
+    //
+    // This is an ALTERNATIVE to the magic-link flow, not a second factor
+    // layered on top of it: a user with TOTP enabled can sign in with either
+    // "email me a link" (above) OR a 6-digit authenticator code, their
+    // choice. Combining both into mandatory 2FA was considered and rejected
+    // here — see README.md "TOTP alternative sign-in" for the full reasoning
+    // (this plugin's whole premise is
+    // reducing friction; forcing every magic-link user to also hold a code
+    // would silently turn "alternative" into "mandatory 2FA" for anyone who
+    // ever enables TOTP, which is a bigger behavioural change than asked for).
+
+    /** GET: show the "enter your authenticator code" alternative sign-in form. */
+    public function totp($args, $request): void
+    {
+        if (Validation::isLoggedIn()) {
+            $request->redirect(null, 'dashboard');
+        }
+        $this->plugin()->ensureEnabled($request);
+
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+        $templateMgr->assign('totpLoginUrl',
+            $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpLogin')
+        );
+        $templateMgr->display($this->plugin()->getTemplateResource('totp.tpl'));
+    }
+
+    /**
+     * POST: verify a TOTP code and, if it matches an enabled account, sign in.
+     * Same neutral-error posture as the magic-link flow: a wrong identifier,
+     * an account without TOTP enabled, and a wrong code all produce the same
+     * generic error message, so this endpoint cannot be used to enumerate
+     * which accounts have TOTP enabled.
+     */
+    public function totpLogin($args, $request): void
+    {
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totp');
+        }
+        $plugin = $this->plugin();
+        $plugin->ensureEnabled($request);
+
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
+
+        if (!self::withinKeyedRateLimit('totpip', $ip, self::RL_TOTP_IP_MAX, self::RL_TOTP_IP_WIN)) {
+            error_log("[magicLogin] TOTP_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'TOTP_RATELIMIT', null, $ip);
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $identifier = $this->sanitizeTotpIdentifier((string) $request->getUserVar('identifier'));
+        $code       = $this->sanitizeTotpCode((string) $request->getUserVar('code'));
+
+        if ($identifier === null || $code === null) {
+            error_log("[magicLogin] TOTP_FAIL ip={$ip} reason=malformed_input");
+            $this->recordAttempt($contextId, 'TOTP_FAIL', null, $ip, 'malformed_input');
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.invalid'));
+            return;
+        }
+
+        // Per-account rate limit too: an attacker who already knows (or
+        // guesses) one victim's username/email must still be throttled even
+        // if they spread attempts across many IPs.
+        $accountKey = hash('sha256', strtolower($identifier));
+        if (!self::withinKeyedRateLimit('totpacct', $accountKey, self::RL_TOTP_ACCOUNT_MAX, self::RL_TOTP_ACCOUNT_WIN)) {
+            error_log("[magicLogin] TOTP_RATELIMIT ip={$ip} scope=account");
+            $this->recordAttempt($contextId, 'TOTP_RATELIMIT', null, $ip);
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $user = Repo::user()->getByUsername($identifier, false)
+            ?: Repo::user()->getByEmail($identifier, false);
+
+        $verified = false;
+        if ($user && !$user->getDisabled()) {
+            $verified = (new TotpAccountService())->verifyLoginCode($user, $code);
+        }
+
+        if (!$verified) {
+            error_log("[magicLogin] TOTP_FAIL ip={$ip} reason=invalid_code");
+            $this->recordAttempt($contextId, 'TOTP_FAIL', $user ? $user->getId() : null, $ip, 'invalid_code');
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.invalid'));
+            return;
+        }
+
+        if (SessionService::establishSession($user, 'magicLoginTotp')) {
+            error_log("[magicLogin] TOTP_LOGIN_SUCCESS user_id={$user->getId()} ip={$ip}");
+            $this->recordAttempt($contextId, 'TOTP_LOGIN_SUCCESS', $user->getId(), $ip);
+            $request->redirect(null, 'dashboard');
+        }
+
+        error_log("[magicLogin] TOTP_FAIL ip={$ip} user_id={$user->getId()} reason=session_failed");
+        $this->recordAttempt($contextId, 'TOTP_FAIL', $user->getId(), $ip, 'session_failed');
+        $this->showTotpError($request, __('plugins.generic.magicLogin.error.invalid'));
+    }
+
+    // ── TOTP: self-service enable / disable (logged-in user only) ────────────
+
+    /** GET: the logged-in user's own TOTP settings page. */
+    public function totpSetup($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        $this->renderTotpSetup($request, $user);
+    }
+
+    /**
+     * POST: confirm a pending TOTP setup by proving possession of the secret
+     * (entering one valid code) before it is enabled.
+     */
+    public function totpConfirm($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totpSetup');
+        }
+
+        $ip   = $this->clientIp();
+        $code = $this->sanitizeTotpCode((string) $request->getUserVar('code'));
+
+        if ($code === null || !(new TotpAccountService())->confirmSetup($user, $code)) {
+            error_log("[magicLogin] TOTP_ENABLE_FAIL ip={$ip} user_id={$user->getId()}");
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.totpSetup.error.confirm'));
+            return;
+        }
+
+        error_log("[magicLogin] TOTP_ENABLED ip={$ip} user_id={$user->getId()}");
+        $this->renderTotpSetup($request, $user, null, __('plugins.generic.magicLogin.totpSetup.enabled'));
+    }
+
+    /**
+     * POST: disable TOTP for the current account. Requires the account's
+     * current password to be re-entered (re-authentication) — a logged-in
+     * session (e.g. a hijacked or shared browser session) is not by itself
+     * sufficient authority to turn off a security feature on the account.
+     */
+    public function totpDisable($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totpSetup');
+        }
+
+        $ip       = $this->clientIp();
+        $password = (string) $request->getUserVar('password');
+
+        if (!self::withinKeyedRateLimit('totpdisable', hash('sha256', (string) $user->getId()), self::RL_TOTP_ACCOUNT_MAX, self::RL_TOTP_ACCOUNT_WIN)) {
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $reason = null;
+        if ($password === '' || !Validation::checkCredentials($user->getUsername(), $password, $reason)) {
+            error_log("[magicLogin] TOTP_DISABLE_FAIL ip={$ip} user_id={$user->getId()} reason=bad_password");
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.totpSetup.error.password'));
+            return;
+        }
+
+        (new TotpAccountService())->disable($user->getId());
+        error_log("[magicLogin] TOTP_DISABLED ip={$ip} user_id={$user->getId()}");
+        $this->renderTotpSetup($request, $user, null, __('plugins.generic.magicLogin.totpSetup.disabled'));
+    }
+
+    /**
+     * Render the logged-in user's TOTP settings page. If TOTP is not
+     * currently enabled, (re)generates a pending secret so the page always
+     * shows a fresh QR-equivalent (otpauth:// URI) + manual-entry secret to
+     * set up against. See totpSetup.tpl / README for the "text entry instead
+     * of a rendered QR image" judgement call.
+     */
+    private function renderTotpSetup($request, $user, ?string $error = null, ?string $success = null): void
+    {
+        $service = new TotpAccountService();
+        $context = $request->getContext();
+
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+
+        $enabled = $service->isEnabled($user->getId());
+        $templateMgr->assign([
+            'totpEnabled'    => $enabled,
+            'totpConfirmUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpConfirm'),
+            'totpDisableUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpDisable'),
+            'error'          => $error,
+            'success'        => $success,
+        ]);
+
+        if (!$enabled) {
+            $issuer = $context ? $context->getLocalizedData('name') : 'OJS';
+            $setup  = $service->getOrCreatePendingSetup($user, (string) $issuer);
+            $templateMgr->assign([
+                'totpSecret' => $setup['secret'],
+                'totpUri'    => $setup['uri'],
+            ]);
+        }
+
+        $templateMgr->display($this->plugin()->getTemplateResource('totpSetup.tpl'));
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     /**
@@ -295,6 +512,104 @@ class MagicLoginHandler extends Handler
         $this->registerAssets($templateMgr, $request);
         $templateMgr->assign('neutralMessage', __('plugins.generic.magicLogin.request.sent'));
         $templateMgr->display($plugin->getTemplateResource('request.tpl'));
+    }
+
+    private function showTotpError($request, string $message): void
+    {
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+        $templateMgr->assign([
+            'error'       => $message,
+            'totpLoginUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpLogin'),
+        ]);
+        $templateMgr->display($this->plugin()->getTemplateResource('totp.tpl'));
+    }
+
+    /**
+     * Require an active, logged-in session before serving a TOTP self-service
+     * account page. Not a full PKP authorization-policy chain (this handler
+     * predates that here and the rest of the class doesn't use one either),
+     * but the same check OJS's own account pages rely on: no session, no page.
+     */
+    private function requireLoggedInUser($request)
+    {
+        if (!Validation::isLoggedIn()) {
+            $request->redirect(null, 'login', 'signIn');
+        }
+        $user = $request->getUser();
+        if (!$user) {
+            $request->redirect(null, 'login', 'signIn');
+        }
+        return $user;
+    }
+
+    /**
+     * Validate the identifier (username or email) field on the TOTP
+     * alternative-login form. Returns the trimmed value or null.
+     */
+    private function sanitizeTotpIdentifier(string $raw): ?string
+    {
+        $value = trim($raw);
+        if ($value === '' || strlen($value) > self::TOTP_IDENTIFIER_MAX_LEN) {
+            return null;
+        }
+        return $value;
+    }
+
+    /** Validate a 6-digit authenticator code. Returns the code unchanged or null. */
+    private function sanitizeTotpCode(string $raw): ?string
+    {
+        $code = trim($raw);
+        return preg_match(self::TOTP_CODE_PATTERN, $code) === 1 ? $code : null;
+    }
+
+    /**
+     * File-based sliding-window rate limiter keyed by an arbitrary safe
+     * string (IP address OR a hashed account identifier), reusing exactly
+     * the same lock-file / sliding-window pattern as withinRateLimit() below
+     * — duplicated rather than refactored in place so the already-reviewed
+     * magic-link rate limiter is not touched by this change.
+     */
+    private static function withinKeyedRateLimit(string $action, string $key, int $max, int $windowSecs): bool
+    {
+        $dir = BASE_SYS_DIR . '/cache/_rl';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        $safeAction = preg_replace('/[^a-z]/i', '', $action);
+        $safeKey    = preg_replace('/[^0-9a-fA-F]/', '_', $key);
+        $file       = "{$dir}/ml_{$safeAction}_{$safeKey}.json";
+
+        $handle = @fopen($file, 'c+');
+        if ($handle === false) {
+            return true; // fail open rather than block all logins on a filesystem hiccup
+        }
+
+        try {
+            if (!flock($handle, LOCK_EX)) {
+                return true;
+            }
+
+            $now  = time();
+            $raw  = stream_get_contents($handle);
+            $hits = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+            $hits = array_values(array_filter($hits, static fn($t) => is_int($t) && $t > $now - $windowSecs));
+
+            if (count($hits) >= $max) {
+                flock($handle, LOCK_UN);
+                return false;
+            }
+            $hits[] = $now;
+
+            ftruncate($handle, 0);
+            rewind($handle);
+            fwrite($handle, json_encode($hits));
+            fflush($handle);
+            flock($handle, LOCK_UN);
+            return true;
+        } finally {
+            fclose($handle);
+        }
     }
 
     private function showConfirmError($request, string $message): void

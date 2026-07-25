@@ -4,8 +4,8 @@
 <version>
 	<application>magicLogin</application>
 	<type>plugins.generic</type>
-	<release>1.2.1.0</release>
-	<date>2026-06-03</date>
+	<release>1.3.0.0</release>
+	<date>2026-07-25</date>
 	<lazy-load>1</lazy-load>
 	<class>MagicLoginPlugin</class>
 </version>

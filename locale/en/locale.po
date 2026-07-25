@@ -183,3 +183,94 @@ msgstr "The one-time sign-in URL (expires after {expiryMinutes} minutes)"
 
 msgid "plugins.generic.magicLogin.mailable.var.expiryMinutes"
 msgstr "Number of minutes until the link expires"
+
+# ── TOTP: recent-activity event labels ─────────────────────────────────────────
+msgid "plugins.generic.magicLogin.activity.event.totpRateLimited"
+msgstr "Authenticator code blocked (rate limit)"
+
+msgid "plugins.generic.magicLogin.activity.event.totpFail"
+msgstr "Authenticator code sign-in failed"
+
+msgid "plugins.generic.magicLogin.activity.event.totpLoginSuccess"
+msgstr "Signed in (authenticator code)"
+
+# ── TOTP: alternative sign-in link on the request page ─────────────────────────
+msgid "plugins.generic.magicLogin.request.useTotp"
+msgstr "Use an authenticator code instead"
+
+# ── TOTP: alt-login page (GET/POST /magicLogin/totp, /totpLogin) ───────────────
+msgid "plugins.generic.magicLogin.totp.title"
+msgstr "Sign in with an authenticator code"
+
+msgid "plugins.generic.magicLogin.totp.section"
+msgstr "Authenticator sign-in"
+
+msgid "plugins.generic.magicLogin.totp.heading"
+msgstr "Enter your authenticator code"
+
+msgid "plugins.generic.magicLogin.totp.help"
+msgstr "If you've enabled an authenticator app on your account, enter your username or email and the current 6-digit code."
+
+msgid "plugins.generic.magicLogin.totp.identifierLabel"
+msgstr "Username or email"
+
+msgid "plugins.generic.magicLogin.totp.identifierPlaceholder"
+msgstr "you@institution.edu"
+
+msgid "plugins.generic.magicLogin.totp.codeLabel"
+msgstr "Authenticator code"
+
+msgid "plugins.generic.magicLogin.totp.button"
+msgstr "Sign in"
+
+msgid "plugins.generic.magicLogin.totp.useLinkInstead"
+msgstr "Email me a sign-in link instead"
+
+# ── TOTP: self-service setup page (magicLogin/totpSetup) ───────────────────────
+msgid "plugins.generic.magicLogin.totpSetup.title"
+msgstr "Authenticator app sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.section"
+msgstr "Account security"
+
+msgid "plugins.generic.magicLogin.totpSetup.heading"
+msgstr "Authenticator app sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.profileLink"
+msgstr "Manage authenticator app sign-in (TOTP)"
+
+msgid "plugins.generic.magicLogin.totpSetup.setupHelp"
+msgstr "Scan or enter this secret into an authenticator app (Google Authenticator, Authy, 1Password, etc.), then enter the 6-digit code it shows to turn on authenticator sign-in for your account."
+
+msgid "plugins.generic.magicLogin.totpSetup.uriLabel"
+msgstr "Setup link (tap to open in an authenticator app on this device)"
+
+msgid "plugins.generic.magicLogin.totpSetup.secretLabel"
+msgstr "Or enter this secret manually"
+
+msgid "plugins.generic.magicLogin.totpSetup.codeLabel"
+msgstr "Code from your authenticator app"
+
+msgid "plugins.generic.magicLogin.totpSetup.confirmButton"
+msgstr "Turn on authenticator sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.enabledHelp"
+msgstr "Authenticator sign-in is turned on for your account. You can sign in with either your password, a magic link, or a code from your authenticator app."
+
+msgid "plugins.generic.magicLogin.totpSetup.passwordLabel"
+msgstr "Confirm your password to continue"
+
+msgid "plugins.generic.magicLogin.totpSetup.disableButton"
+msgstr "Turn off authenticator sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.enabled"
+msgstr "Authenticator sign-in is now turned on for your account."
+
+msgid "plugins.generic.magicLogin.totpSetup.disabled"
+msgstr "Authenticator sign-in has been turned off for your account."
+
+msgid "plugins.generic.magicLogin.totpSetup.error.confirm"
+msgstr "That code didn't match. Please check your authenticator app and try again."
+
+msgid "plugins.generic.magicLogin.totpSetup.error.password"
+msgstr "Incorrect password. Please try again."

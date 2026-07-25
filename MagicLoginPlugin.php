@@ -53,6 +53,7 @@ class MagicLoginPlugin extends GenericPlugin
 
         Hook::add('LoadHandler',           [$this, 'setupHandler']);
         Hook::add('TemplateManager::display', [$this, 'addLoginLink']);
+        Hook::add('TemplateManager::display', [$this, 'addTotpAccountLink']);
         Hook::add('Mailer::Mailables',     [$this, 'addMailable']);
 
         // Ensure the email template is installed for the current context.
@@ -222,6 +223,50 @@ class MagicLoginPlugin extends GenericPlugin
             return preg_replace($pattern, '$1' . $block . '$2', $output, 1);
         }
         // Fallback: after the first closing form tag on the page.
+        $pos = stripos($output, '</form>');
+        if ($pos !== false) {
+            return substr($output, 0, $pos + 7) . $block . substr($output, $pos + 7);
+        }
+        return $output;
+    }
+
+    /**
+     * Best-effort injection of a "Manage two-factor sign-in" link into the
+     * logged-in user's own profile page, so TOTP setup is discoverable
+     * without needing a theme edit — same technique as injectLoginButton().
+     * If the running theme's profile template markup doesn't match the
+     * expected marker, this simply no-ops (the page is still directly
+     * reachable at magicLogin/totpSetup; see README).
+     */
+    public function addTotpAccountLink(string $hookName, array $args): bool
+    {
+        $template = $args[1];
+        if (!str_contains($template, 'userProfile.tpl')) {
+            return Hook::CONTINUE;
+        }
+        $request = Application::get()->getRequest();
+        $context = $request->getContext();
+        if (!$context || !$this->getSetting($context->getId(), 'enabled')) {
+            return Hook::CONTINUE;
+        }
+        /** @var \APP\template\TemplateManager $templateMgr */
+        $templateMgr = $args[0];
+        $templateMgr->registerFilter('output', [$this, 'injectTotpAccountLink']);
+        return Hook::CONTINUE;
+    }
+
+    /** Smarty output filter: inject the TOTP account-settings link into the profile page. */
+    public function injectTotpAccountLink(string $output, $templateMgr): string
+    {
+        if (str_contains($output, 'magic-login-totp-inject') || str_contains($output, 'magicLogin/totpSetup')) {
+            return $output;
+        }
+        $request = Application::get()->getRequest();
+        $url     = $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpSetup');
+        $label   = htmlspecialchars((string) __('plugins.generic.magicLogin.totpSetup.profileLink'), ENT_QUOTES);
+        $block   = '<div class="magic-login-totp-inject" style="margin:1rem 0;padding:1rem;border-top:1px solid rgba(0,0,0,.08);">'
+                 . '<a href="' . htmlspecialchars($url, ENT_QUOTES) . '">' . $label . '</a></div>';
+
         $pos = stripos($output, '</form>');
         if ($pos !== false) {
             return substr($output, 0, $pos + 7) . $block . substr($output, $pos + 7);

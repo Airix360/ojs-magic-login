@@ -31,6 +31,9 @@ class MagicLoginSettingsForm extends Form
         'LOGIN_SUCCESS'     => 'plugins.generic.magicLogin.activity.event.loginSuccess',
         'LOGIN_FAIL'        => 'plugins.generic.magicLogin.activity.event.loginFail',
         'LOGIN_RATELIMIT'   => 'plugins.generic.magicLogin.activity.event.loginRateLimited',
+        'TOTP_RATELIMIT'    => 'plugins.generic.magicLogin.activity.event.totpRateLimited',
+        'TOTP_FAIL'         => 'plugins.generic.magicLogin.activity.event.totpFail',
+        'TOTP_LOGIN_SUCCESS' => 'plugins.generic.magicLogin.activity.event.totpLoginSuccess',
     ];
 
     private MagicLoginPlugin $plugin;
