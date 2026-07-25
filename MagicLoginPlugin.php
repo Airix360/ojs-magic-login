@@ -141,8 +141,10 @@ class MagicLoginPlugin extends GenericPlugin
      */
     private function migrateVersionRecord(): void
     {
-        // Site-level (context 0) since the versions table itself is site-wide.
-        if ($this->getSetting(0, self::SETTING_VERSION_RECORD_MIGRATED)) {
+        // Site-level (context null) since the versions table itself is site-wide.
+        // plugin_settings.context_id has a FK to journals(journal_id), which has
+        // no row for id 0 — only NULL (site-wide) or a real journal id are valid.
+        if ($this->getSetting(null, self::SETTING_VERSION_RECORD_MIGRATED)) {
             return;
         }
 
@@ -162,7 +164,7 @@ class MagicLoginPlugin extends GenericPlugin
         } catch (\Throwable $e) {
             error_log('[magicLogin] migrateVersionRecord failed: ' . $e->getMessage());
         } finally {
-            $this->updateSetting(0, self::SETTING_VERSION_RECORD_MIGRATED, true, 'bool');
+            $this->updateSetting(null, self::SETTING_VERSION_RECORD_MIGRATED, true, 'bool');
         }
     }
 
