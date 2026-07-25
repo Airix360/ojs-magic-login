@@ -29,6 +29,46 @@ msgstr "Minimum seconds between requests per account"
 msgid "plugins.generic.magicLogin.settings.minInterval.description"
 msgstr "Prevents a single account from flooding itself with links. Minimum 30, maximum 3600. Default: 60."
 
+# ── Recent activity panel (Settings) ───────────────────────────────────────────
+msgid "plugins.generic.magicLogin.activity.title"
+msgstr "Recent magic-link activity"
+
+msgid "plugins.generic.magicLogin.activity.empty"
+msgstr "No magic-link activity recorded yet."
+
+msgid "plugins.generic.magicLogin.activity.time"
+msgstr "Time"
+
+msgid "plugins.generic.magicLogin.activity.event"
+msgstr "Event"
+
+msgid "plugins.generic.magicLogin.activity.user"
+msgstr "User"
+
+msgid "plugins.generic.magicLogin.activity.ip"
+msgstr "IP"
+
+msgid "plugins.generic.magicLogin.activity.unknownUser"
+msgstr "—"
+
+msgid "plugins.generic.magicLogin.activity.event.linkSent"
+msgstr "Link sent"
+
+msgid "plugins.generic.magicLogin.activity.event.linkSendFailed"
+msgstr "Link send failed"
+
+msgid "plugins.generic.magicLogin.activity.event.sendRateLimited"
+msgstr "Send blocked (rate limit)"
+
+msgid "plugins.generic.magicLogin.activity.event.loginSuccess"
+msgstr "Signed in"
+
+msgid "plugins.generic.magicLogin.activity.event.loginFail"
+msgstr "Sign-in failed"
+
+msgid "plugins.generic.magicLogin.activity.event.loginRateLimited"
+msgstr "Sign-in blocked (rate limit)"
+
 # ── Shared / chrome strings ───────────────────────────────────────────────────
 msgid "plugins.generic.magicLogin.shared.secureConnection"
 msgstr "Secure connection"

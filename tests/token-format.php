@@ -198,6 +198,69 @@ ok(
     'login() no longer calls the non-atomic consume() after a separate verify()'
 );
 
+// ── Recent-activity log: source-level regression check ───────────────────────
+//
+// New in this branch: an admin-facing "recent activity" panel in Settings,
+// backed by a capped JSON list written by MagicLoginHandler::recordAttempt().
+// It is explicitly a best-effort visibility log, not a security control, so
+// these checks confirm (a) it exists and is wired to every event, (b) it is
+// capped so the stored setting cannot grow unbounded, and (c) a write failure
+// there cannot break the login flow (caught, not rethrown).
+
+echo "\n[Recent activity log]\n";
+$pluginSrc = file_get_contents(__DIR__ . '/../MagicLoginPlugin.php');
+$formSrc   = file_get_contents(__DIR__ . '/../MagicLoginSettingsForm.php');
+
+ok(
+    strpos($pluginSrc, 'RECENT_ATTEMPTS_SETTING') !== false
+        && strpos($pluginSrc, 'RECENT_ATTEMPTS_MAX') !== false,
+    'MagicLoginPlugin defines the recent-attempts setting name and cap'
+);
+ok(
+    strpos($handlerSrc, 'private function recordAttempt(') !== false,
+    'MagicLoginHandler defines recordAttempt()'
+);
+ok(
+    (bool) preg_match('/function recordAttempt\(.*?\{\s*try\s*\{/s', $handlerSrc),
+    'recordAttempt() wraps its work in try/catch so a logging failure cannot break login'
+);
+ok(
+    strpos($handlerSrc, 'array_slice($events, 0, MagicLoginPlugin::RECENT_ATTEMPTS_MAX)') !== false,
+    'recordAttempt() caps the stored event list to RECENT_ATTEMPTS_MAX'
+);
+
+// Every event already written to error_log should also call recordAttempt(),
+// so the admin panel and the error_log stream never drift apart.
+$expectedEvents = [
+    'SEND_RATELIMIT',
+    'LINK_SENT',
+    'LINK_SEND_FAILED',
+    'LOGIN_RATELIMIT',
+    'LOGIN_FAIL',
+    'LOGIN_SUCCESS',
+];
+foreach ($expectedEvents as $eventCode) {
+    ok(
+        (bool) preg_match('/recordAttempt\([^)]*\'' . preg_quote($eventCode, '/') . '\'/', $handlerSrc),
+        "recordAttempt() is called for {$eventCode}"
+    );
+}
+
+ok(
+    strpos($formSrc, 'buildRecentAttemptsView') !== false,
+    'MagicLoginSettingsForm builds a read-only recent-attempts view for the template'
+);
+ok(
+    strpos($formSrc, "setData('recentAttempts'") !== false,
+    'MagicLoginSettingsForm exposes recentAttempts to settings.tpl'
+);
+
+$templateSrc = file_get_contents(__DIR__ . '/../templates/settings.tpl');
+ok(
+    strpos($templateSrc, '$recentAttempts') !== false,
+    'settings.tpl renders $recentAttempts'
+);
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 echo "\n" . str_repeat('─', 50) . "\n";

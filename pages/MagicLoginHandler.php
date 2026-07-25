@@ -35,6 +35,7 @@ use APP\handler\Handler;
 use APP\plugins\generic\magicLogin\classes\SessionService;
 use APP\plugins\generic\magicLogin\classes\TokenService;
 use APP\plugins\generic\magicLogin\mailables\MagicLoginLink;
+use APP\plugins\generic\magicLogin\MagicLoginPlugin;
 use APP\template\TemplateManager;
 use Illuminate\Support\Facades\Mail;
 use PKP\core\Registry;
@@ -98,18 +99,20 @@ class MagicLoginHandler extends Handler
         $plugin = $this->plugin();
         $plugin->ensureEnabled($request);
 
-        $ip = $this->clientIp();
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
 
         // Per-IP rate limit prevents one IP from flooding many accounts.
         if (!self::withinRateLimit('send', $ip, self::RL_SEND_MAX, self::RL_SEND_WIN)) {
             error_log("[magicLogin] SEND_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'SEND_RATELIMIT', null, $ip);
             // Show the same neutral message so the IP can't confirm the limit was hit.
             $this->showNeutralSentPage($request, $plugin);
             return;
         }
 
-        $context = $request->getContext();
-        $email   = $this->sanitizeEmail((string) $request->getUserVar('email'));
+        $email = $this->sanitizeEmail((string) $request->getUserVar('email'));
 
         // Timed from here so the matched and unmatched branches below can be
         // normalized to the same minimum wall-clock duration (timing
@@ -119,13 +122,15 @@ class MagicLoginHandler extends Handler
         if ($email !== null) {
             $user = Repo::user()->getByEmail($email, false); // active users only
             if ($user && !$user->getDisabled()) {
-                $ttl   = $plugin->ttlSeconds($context->getId());
-                $token = (new TokenService())->issue($user, $ttl, $plugin->minIntervalSeconds($context->getId()));
+                $ttl   = $plugin->ttlSeconds($contextId);
+                $token = (new TokenService())->issue($user, $ttl, $plugin->minIntervalSeconds($contextId));
                 if ($token) {
                     if ($this->emailLink($user, $token, $context, $request, (int) round($ttl / 60))) {
                         error_log("[magicLogin] LINK_SENT user_id={$user->getId()} ip={$ip}");
+                        $this->recordAttempt($contextId, 'LINK_SENT', $user->getId(), $ip);
                     } else {
                         error_log("[magicLogin] LINK_SEND_FAILED user_id={$user->getId()} ip={$ip}");
+                        $this->recordAttempt($contextId, 'LINK_SEND_FAILED', $user->getId(), $ip);
                     }
                 }
             } else {
@@ -203,11 +208,14 @@ class MagicLoginHandler extends Handler
         }
         $this->plugin()->ensureEnabled($request);
 
-        $ip = $this->clientIp();
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
 
         // Per-IP rate limit on verify attempts.
         if (!self::withinRateLimit('login', $ip, self::RL_LOGIN_MAX, self::RL_LOGIN_WIN)) {
             error_log("[magicLogin] LOGIN_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'LOGIN_RATELIMIT', null, $ip);
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.rateLimit'));
             return;
         }
@@ -216,6 +224,7 @@ class MagicLoginHandler extends Handler
 
         if ($token === null) {
             error_log("[magicLogin] LOGIN_FAIL ip={$ip} reason=malformed_token");
+            $this->recordAttempt($contextId, 'LOGIN_FAIL', null, $ip, 'malformed_token');
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.invalid'));
             return;
         }
@@ -228,21 +237,57 @@ class MagicLoginHandler extends Handler
 
         if (!$user) {
             error_log("[magicLogin] LOGIN_FAIL ip={$ip} reason=invalid_or_expired_token");
+            $this->recordAttempt($contextId, 'LOGIN_FAIL', null, $ip, 'invalid_or_expired_token');
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.invalid'));
             return;
         }
 
         if (SessionService::establishSession($user, 'magicLogin')) {
             error_log("[magicLogin] LOGIN_SUCCESS user_id={$user->getId()} ip={$ip}");
+            $this->recordAttempt($contextId, 'LOGIN_SUCCESS', $user->getId(), $ip);
             $request->redirect(null, 'dashboard');
         }
 
         // Session establishment returned false (account disabled between token issue and use).
         error_log("[magicLogin] LOGIN_FAIL ip={$ip} user_id={$user->getId()} reason=session_failed");
+        $this->recordAttempt($contextId, 'LOGIN_FAIL', $user->getId(), $ip, 'session_failed');
         $request->redirect(null, 'magicLogin', 'request');
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Append an event to the capped, per-context "recent activity" list shown
+     * in the plugin's Settings panel (admin-facing visibility only).
+     *
+     * This is a best-effort log, not a security control: it is read-modify-
+     * write against a single plugin setting row rather than an append-only
+     * table, so a lost update under concurrent requests is a cosmetic
+     * (missing) log entry, never a false one and never something a security
+     * decision depends on. Failures here must never break the login flow.
+     */
+    private function recordAttempt(int $contextId, string $event, ?int $userId, string $ip, ?string $reason = null): void
+    {
+        try {
+            $plugin = $this->plugin();
+            $raw    = (string) $plugin->getSetting($contextId, MagicLoginPlugin::RECENT_ATTEMPTS_SETTING);
+            $events = $raw !== '' ? json_decode($raw, true) : [];
+            if (!is_array($events)) {
+                $events = [];
+            }
+            array_unshift($events, [
+                'ts'      => time(),
+                'event'   => $event,
+                'user_id' => $userId,
+                'ip'      => $ip,
+                'reason'  => $reason,
+            ]);
+            $events = array_slice($events, 0, MagicLoginPlugin::RECENT_ATTEMPTS_MAX);
+            $plugin->updateSetting($contextId, MagicLoginPlugin::RECENT_ATTEMPTS_SETTING, json_encode($events), 'string');
+        } catch (\Throwable $e) {
+            error_log('[magicLogin] recordAttempt failed (non-fatal): ' . $e->getMessage());
+        }
+    }
 
     private function showNeutralSentPage($request, $plugin): void
     {
