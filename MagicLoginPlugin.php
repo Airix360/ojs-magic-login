@@ -115,14 +115,27 @@ class MagicLoginPlugin extends GenericPlugin
 
     // ── DB migration ─────────────────────────────────────────────────────────
 
+    /** Site-level plugin setting flag recording that migrateVersionRecord() has already run. */
+    private const SETTING_VERSION_RECORD_MIGRATED = 'versionRecordMigrated';
+
     /**
      * v1.0.0 shipped with <application>ojs2</application> in version.xml,
      * causing OJS to record product='ojs2' in the versions table instead of
      * the correct 'magicLogin'.  Rename the row so version tracking and the
      * plugin list work correctly on existing installations.
+     *
+     * This is a one-time fix-up: once it has run (successfully or not, so a
+     * transient failure doesn't retry forever either) it is gated behind a
+     * persisted site-level setting so it does not run again on every
+     * subsequent page load site-wide.
      */
     private function migrateVersionRecord(): void
     {
+        // Site-level (context 0) since the versions table itself is site-wide.
+        if ($this->getSetting(0, self::SETTING_VERSION_RECORD_MIGRATED)) {
+            return;
+        }
+
         try {
             $alreadyCorrect = DB::table('versions')
                 ->where('product_type', 'plugins.generic')
@@ -138,6 +151,8 @@ class MagicLoginPlugin extends GenericPlugin
             }
         } catch (\Throwable $e) {
             error_log('[magicLogin] migrateVersionRecord failed: ' . $e->getMessage());
+        } finally {
+            $this->updateSetting(0, self::SETTING_VERSION_RECORD_MIGRATED, true, 'bool');
         }
     }
 
