@@ -72,6 +72,7 @@ Passwordless sign-in for Open Journal Systems 3.5. Users receive a one-time link
 - Neutral send response — identical whether the email matched an account or not
 - Email template editable from **Settings › Emails** (key `MAGIC_LOGIN_LINK`)
 - Settings panel in **Settings › Website › Plugins** — enable/disable per journal, configure TTL and throttle
+- Recent-activity panel in the same Settings screen — last 20 sends/sign-ins/rate-limit hits per journal, for admin visibility (not a security control)
 - Theme-override support — supply `request.tpl` / `confirm.tpl` inside your theme to apply a custom design
 - Zero modifications to OJS core files — hooks only
 
@@ -158,12 +159,12 @@ User clicks Sign in      POST /magicLogin/login
 | Property | Implementation |
 |----------|----------------|
 | Secret storage | Only `sha256(verifier)` stored; raw verifier never touches the database |
-| Timing attack prevention | `hash_equals()` for constant-time comparison |
-| Single-use | Token deleted before session creation; replay is impossible |
+| Timing attack prevention | `hash_equals()` for constant-time hash comparison, plus response-time padding on `/send` so a matched vs. unmatched email cannot be distinguished by request latency |
+| Single-use | Token verified and consumed atomically in one DB transaction (row-locked) before session creation; concurrent requests replaying the same token cannot both succeed |
 | Short expiry | 15 minutes by default; administrator-configurable |
 | Rate limiting | Per-IP sliding window: 5 sends / 10 min, 10 verify attempts / 5 min |
 | Account enumeration | Send endpoint returns identical response for matched and unmatched emails |
-| CSRF | OJS built-in CSRF token enforced on every mutating endpoint |
+| CSRF | OJS built-in CSRF token enforced unconditionally on every mutating endpoint, including requests from an already-logged-in session (prevents login-CSRF) |
 | Core changes | None — the plugin is entirely hook-based |
 
 ---

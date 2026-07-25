@@ -25,6 +25,16 @@ use PKP\plugins\Hook;
 
 class MagicLoginPlugin extends GenericPlugin
 {
+    /**
+     * Plugin setting (per-context) holding a JSON-encoded, capped, newest-first
+     * list of recent magic-login events for the "Recent activity" panel shown
+     * in Settings. Purely for admin visibility — never read by any security
+     * decision, so a lost update under concurrent writes is a cosmetic
+     * (not a security) issue.
+     */
+    public const RECENT_ATTEMPTS_SETTING = 'magicLoginRecentAttempts';
+    public const RECENT_ATTEMPTS_MAX     = 20;
+
     public function register($category, $path, $mainContextId = null)
     {
         $success = parent::register($category, $path, $mainContextId);

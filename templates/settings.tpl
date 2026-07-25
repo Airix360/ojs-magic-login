@@ -27,3 +27,27 @@
 	{/fbvFormArea}
 	{fbvFormButtons submitText="common.save"}
 </form>
+
+<div class="magicLoginRecentActivity">
+	<h3>{translate key="plugins.generic.magicLogin.activity.title"}</h3>
+	{if $recentAttempts && $recentAttempts|@count > 0}
+		<table class="listing">
+			<tr>
+				<th>{translate key="plugins.generic.magicLogin.activity.time"}</th>
+				<th>{translate key="plugins.generic.magicLogin.activity.event"}</th>
+				<th>{translate key="plugins.generic.magicLogin.activity.user"}</th>
+				<th>{translate key="plugins.generic.magicLogin.activity.ip"}</th>
+			</tr>
+			{foreach from=$recentAttempts item=attempt}
+				<tr>
+					<td>{$attempt.time|escape}</td>
+					<td>{$attempt.event|escape}</td>
+					<td>{$attempt.user|escape}</td>
+					<td>{$attempt.ip|escape}</td>
+				</tr>
+			{/foreach}
+		</table>
+	{else}
+		<p>{translate key="plugins.generic.magicLogin.activity.empty"}</p>
+	{/if}
+</div>
