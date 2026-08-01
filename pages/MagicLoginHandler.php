@@ -438,8 +438,8 @@ class MagicLoginHandler extends Handler
     /**
      * Render the logged-in user's TOTP settings page. If TOTP is not
      * currently enabled, (re)generates a pending secret so the page always
-     * shows a fresh QR-equivalent (otpauth:// URI) + manual-entry secret to
-     * set up against. See totpSetup.tpl / README for the "text entry instead
+     * shows a fresh QR code + otpauth:// URI + manual-entry secret to set up
+     * against. See totpSetup.tpl / README for the "text entry instead
      * of a rendered QR image" judgement call.
      */
     private function renderTotpSetup($request, $user, ?string $error = null, ?string $success = null): void
@@ -466,6 +466,16 @@ class MagicLoginHandler extends Handler
                 'totpSecret' => $setup['secret'],
                 'totpUri'    => $setup['uri'],
             ]);
+            // Vendored davidshimjs/qrcodejs (MIT, no dependencies) — renders
+            // the otpauth:// URI as a real scannable QR client-side. See
+            // README: hand-rolling QR encoding ourselves was ruled out as
+            // too error-prone; using a small, well-established existing
+            // library instead of a from-scratch implementation resolves
+            // that concern without adding a server-side/PHP dependency.
+            $templateMgr->addJavaScript(
+                'magicLoginQrLib',
+                $request->getBaseUrl() . '/' . $this->plugin()->getPluginPath() . '/js/qrcode.js'
+            );
         }
 
         $templateMgr->display($this->plugin()->getTemplateResource('totpSetup.tpl'));

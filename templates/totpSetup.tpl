@@ -33,17 +33,29 @@
 
         <p class="magic-login-sub">{translate key="plugins.generic.magicLogin.totpSetup.setupHelp"}</p>
 
-        {* No QR image is rendered here — see README for the reasoning:
-           drawing a scannable QR code from scratch (matrix layout + Reed-
-           Solomon error correction) is significant complexity for a plugin
-           that otherwise adds zero dependencies. Instead: a tappable
-           otpauth:// link (works when opened on the same device as the
-           authenticator app) plus the raw secret for manual entry, which
-           every authenticator app supports. *}
+        {* QR rendered client-side via vendored davidshimjs/qrcodejs (MIT,
+           no dependencies) — see README for why this uses a small,
+           well-established existing library instead of a from-scratch QR
+           encoder. Falls back gracefully to the tappable link below if JS
+           is unavailable. *}
+        <div class="magic-login-field">
+          <div id="magic-login-qr" style="display:inline-block;padding:12px;background:#fff;border:1px solid rgba(0,0,0,.08);border-radius:4px;"></div>
+        </div>
         <div class="magic-login-field">
           <label class="magic-login-label">{translate key="plugins.generic.magicLogin.totpSetup.uriLabel"}</label>
           <p><a href="{$totpUri|escape}" style="word-break:break-all;">{$totpUri|escape}</a></p>
         </div>
+        <script>
+          document.addEventListener('DOMContentLoaded', function () {ldelim}
+            if (typeof QRCode === 'undefined') {ldelim} return; {rdelim}
+            new QRCode(document.getElementById('magic-login-qr'), {ldelim}
+              text: "{$totpUri|escape:'javascript'}",
+              width: 200,
+              height: 200,
+              correctLevel: QRCode.CorrectLevel.M
+            {rdelim});
+          {rdelim});
+        </script>
         <div class="magic-login-field">
           <label class="magic-login-label">{translate key="plugins.generic.magicLogin.totpSetup.secretLabel"}</label>
           <p style="font-family:monospace;font-size:1.1em;letter-spacing:0.05em;">{$totpSecret|escape}</p>
