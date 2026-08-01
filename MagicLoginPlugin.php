@@ -53,7 +53,12 @@ class MagicLoginPlugin extends GenericPlugin
 
         Hook::add('LoadHandler',           [$this, 'setupHandler']);
         Hook::add('TemplateManager::display', [$this, 'addLoginLink']);
-        Hook::add('TemplateManager::display', [$this, 'addTotpAccountLink']);
+        // The profile Password tab is fetched as an AJAX fragment
+        // (controllers/tab/user/ProfileTabHandler::changePassword() calls
+        // Form::fetch(), never TemplateManager::display()), so this must hook
+        // 'TemplateManager::fetch', not 'TemplateManager::display' — the
+        // latter never fires for this template and silently no-ops.
+        Hook::add('TemplateManager::fetch', [$this, 'addTotpAccountLink']);
         Hook::add('Mailer::Mailables',     [$this, 'addMailable']);
 
         // Ensure the email template is installed for the current context.
@@ -232,16 +237,19 @@ class MagicLoginPlugin extends GenericPlugin
 
     /**
      * Best-effort injection of a "Manage two-factor sign-in" link into the
-     * logged-in user's own profile page, so TOTP setup is discoverable
-     * without needing a theme edit — same technique as injectLoginButton().
-     * If the running theme's profile template markup doesn't match the
-     * expected marker, this simply no-ops (the page is still directly
+     * logged-in user's own Profile › Password tab, so TOTP setup is
+     * discoverable without needing a theme edit — same technique as
+     * injectLoginButton(). If a theme's changePassword.tpl override doesn't
+     * end in a `</form>` tag, this simply no-ops (the page is still directly
      * reachable at magicLogin/totpSetup; see README).
      */
     public function addTotpAccountLink(string $hookName, array $args): bool
     {
+        // 'user/changePassword.tpl' is the actual template the Profile ›
+        // Password tab renders (there is no 'userProfile.tpl' in OJS 3.5 —
+        // the previous check matched nothing and this injector never fired).
         $template = $args[1];
-        if (!str_contains($template, 'userProfile.tpl')) {
+        if (!str_contains($template, 'user/changePassword.tpl')) {
             return Hook::CONTINUE;
         }
         $request = Application::get()->getRequest();
