@@ -10,7 +10,7 @@
 </table>
 
 [![CI](https://github.com/thathman/ojs-magic-login/actions/workflows/ci.yml/badge.svg)](https://github.com/thathman/ojs-magic-login/actions/workflows/ci.yml)
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/thathman)
+[![Sponsor](https://img.shields.io/badge/Sponsor-thathman-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/thathman)
 
 Passwordless sign-in for Open Journal Systems 3.5. Users receive a one-time link by email and sign in with a single click — no password required. Works alongside the standard login; neither flow replaces the other.
 
