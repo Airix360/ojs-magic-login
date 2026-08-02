@@ -29,6 +29,46 @@ msgstr "Minimum seconds between requests per account"
 msgid "plugins.generic.magicLogin.settings.minInterval.description"
 msgstr "Prevents a single account from flooding itself with links. Minimum 30, maximum 3600. Default: 60."
 
+# ── Recent activity panel (Settings) ───────────────────────────────────────────
+msgid "plugins.generic.magicLogin.activity.title"
+msgstr "Recent magic-link activity"
+
+msgid "plugins.generic.magicLogin.activity.empty"
+msgstr "No magic-link activity recorded yet."
+
+msgid "plugins.generic.magicLogin.activity.time"
+msgstr "Time"
+
+msgid "plugins.generic.magicLogin.activity.event"
+msgstr "Event"
+
+msgid "plugins.generic.magicLogin.activity.user"
+msgstr "User"
+
+msgid "plugins.generic.magicLogin.activity.ip"
+msgstr "IP"
+
+msgid "plugins.generic.magicLogin.activity.unknownUser"
+msgstr "—"
+
+msgid "plugins.generic.magicLogin.activity.event.linkSent"
+msgstr "Link sent"
+
+msgid "plugins.generic.magicLogin.activity.event.linkSendFailed"
+msgstr "Link send failed"
+
+msgid "plugins.generic.magicLogin.activity.event.sendRateLimited"
+msgstr "Send blocked (rate limit)"
+
+msgid "plugins.generic.magicLogin.activity.event.loginSuccess"
+msgstr "Signed in"
+
+msgid "plugins.generic.magicLogin.activity.event.loginFail"
+msgstr "Sign-in failed"
+
+msgid "plugins.generic.magicLogin.activity.event.loginRateLimited"
+msgstr "Sign-in blocked (rate limit)"
+
 # ── Shared / chrome strings ───────────────────────────────────────────────────
 msgid "plugins.generic.magicLogin.shared.secureConnection"
 msgstr "Secure connection"
@@ -143,3 +183,165 @@ msgstr "The one-time sign-in URL (expires after {expiryMinutes} minutes)"
 
 msgid "plugins.generic.magicLogin.mailable.var.expiryMinutes"
 msgstr "Number of minutes until the link expires"
+
+# ── TOTP: recent-activity event labels ─────────────────────────────────────────
+msgid "plugins.generic.magicLogin.activity.event.totpRateLimited"
+msgstr "Authenticator code blocked (rate limit)"
+
+msgid "plugins.generic.magicLogin.activity.event.totpFail"
+msgstr "Authenticator code sign-in failed"
+
+msgid "plugins.generic.magicLogin.activity.event.totpLoginSuccess"
+msgstr "Signed in (authenticator code)"
+
+# ── TOTP: alternative sign-in link on the request page ─────────────────────────
+msgid "plugins.generic.magicLogin.request.useTotp"
+msgstr "Use an authenticator code instead"
+
+# ── TOTP: alt-login page (GET/POST /magicLogin/totp, /totpLogin) ───────────────
+msgid "plugins.generic.magicLogin.totp.title"
+msgstr "Sign in with an authenticator code"
+
+msgid "plugins.generic.magicLogin.totp.section"
+msgstr "Authenticator sign-in"
+
+msgid "plugins.generic.magicLogin.totp.heading"
+msgstr "Enter your authenticator code"
+
+msgid "plugins.generic.magicLogin.totp.help"
+msgstr "If you've enabled an authenticator app on your account, enter your username or email and the current 6-digit code."
+
+msgid "plugins.generic.magicLogin.totp.identifierLabel"
+msgstr "Username or email"
+
+msgid "plugins.generic.magicLogin.totp.identifierPlaceholder"
+msgstr "you@institution.edu"
+
+msgid "plugins.generic.magicLogin.totp.codeLabel"
+msgstr "Authenticator code"
+
+msgid "plugins.generic.magicLogin.totp.button"
+msgstr "Sign in"
+
+msgid "plugins.generic.magicLogin.totp.useLinkInstead"
+msgstr "Email me a sign-in link instead"
+
+msgid "plugins.generic.magicLogin.request.usePasskey"
+msgstr "Sign in with a passkey"
+
+# ── TOTP: self-service setup page (magicLogin/totpSetup) ───────────────────────
+msgid "plugins.generic.magicLogin.totpSetup.title"
+msgstr "Authenticator app sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.section"
+msgstr "Account security"
+
+msgid "plugins.generic.magicLogin.totpSetup.heading"
+msgstr "Authenticator app sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.profileLink"
+msgstr "Manage authenticator app sign-in (TOTP)"
+
+msgid "plugins.generic.magicLogin.totpSetup.setupHelp"
+msgstr "Scan or enter this secret into an authenticator app (Google Authenticator, Authy, 1Password, etc.), then enter the 6-digit code it shows to turn on authenticator sign-in for your account."
+
+msgid "plugins.generic.magicLogin.totpSetup.uriLabel"
+msgstr "Setup link (tap to open in an authenticator app on this device)"
+
+msgid "plugins.generic.magicLogin.totpSetup.secretLabel"
+msgstr "Or enter this secret manually"
+
+msgid "plugins.generic.magicLogin.totpSetup.codeLabel"
+msgstr "Code from your authenticator app"
+
+msgid "plugins.generic.magicLogin.totpSetup.confirmButton"
+msgstr "Turn on authenticator sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.enabledHelp"
+msgstr "Authenticator sign-in is turned on for your account. You can sign in with either your password, a magic link, or a code from your authenticator app."
+
+msgid "plugins.generic.magicLogin.totpSetup.passwordLabel"
+msgstr "Confirm your password to continue"
+
+msgid "plugins.generic.magicLogin.totpSetup.disableButton"
+msgstr "Turn off authenticator sign-in"
+
+msgid "plugins.generic.magicLogin.totpSetup.enabled"
+msgstr "Authenticator sign-in is now turned on for your account."
+
+msgid "plugins.generic.magicLogin.totpSetup.disabled"
+msgstr "Authenticator sign-in has been turned off for your account."
+
+msgid "plugins.generic.magicLogin.totpSetup.error.confirm"
+msgstr "That code didn't match. Please check your authenticator app and try again."
+
+msgid "plugins.generic.magicLogin.totpSetup.error.password"
+msgstr "Incorrect password. Please try again."
+
+# ── WebAuthn (passkeys): self-service management (magicLogin/totpSetup page) ───
+msgid "plugins.generic.magicLogin.webauthn.section"
+msgstr "Passkeys"
+
+msgid "plugins.generic.magicLogin.webauthn.heading"
+msgstr "Passkeys"
+
+msgid "plugins.generic.magicLogin.webauthn.help"
+msgstr "Sign in with your device's built-in security — Touch ID, Face ID, Windows Hello, or a security key. No password or code to type."
+
+msgid "plugins.generic.magicLogin.webauthn.none"
+msgstr "You haven't added a passkey yet."
+
+msgid "plugins.generic.magicLogin.webauthn.unnamed"
+msgstr "Unnamed passkey"
+
+msgid "plugins.generic.magicLogin.webauthn.table.name"
+msgstr "Name"
+
+msgid "plugins.generic.magicLogin.webauthn.table.added"
+msgstr "Added"
+
+msgid "plugins.generic.magicLogin.webauthn.table.lastUsed"
+msgstr "Last used"
+
+msgid "plugins.generic.magicLogin.webauthn.nicknameLabel"
+msgstr "Name this passkey (optional)"
+
+msgid "plugins.generic.magicLogin.webauthn.nicknamePlaceholder"
+msgstr "e.g. My iPhone, Work laptop"
+
+msgid "plugins.generic.magicLogin.webauthn.addButton"
+msgstr "Add a passkey"
+
+msgid "plugins.generic.magicLogin.webauthn.removeButton"
+msgstr "Remove"
+
+msgid "plugins.generic.magicLogin.webauthn.confirmRemove"
+msgstr "Remove this passkey? You'll need to set it up again to use it for sign-in."
+
+msgid "plugins.generic.magicLogin.webauthn.removed"
+msgstr "Passkey removed."
+
+msgid "plugins.generic.magicLogin.webauthn.error.tooMany"
+msgstr "You've reached the maximum number of passkeys for this account. Remove one before adding another."
+
+msgid "plugins.generic.magicLogin.webauthn.error.expired"
+msgstr "That passkey setup request expired. Please try again."
+
+msgid "plugins.generic.magicLogin.webauthn.error.registerFailed"
+msgstr "Could not add that passkey. Please try again."
+
+# ── WebAuthn (passkeys): sign-in page (magicLogin/webauthnLogin) ───────────────
+msgid "plugins.generic.magicLogin.webauthn.login.title"
+msgstr "Sign in with a passkey"
+
+msgid "plugins.generic.magicLogin.webauthn.login.section"
+msgstr "Passkey sign-in"
+
+msgid "plugins.generic.magicLogin.webauthn.login.heading"
+msgstr "Sign in with a passkey"
+
+msgid "plugins.generic.magicLogin.webauthn.login.help"
+msgstr "Use your device's built-in security — Touch ID, Face ID, Windows Hello, or a security key — to sign in. No username needed."
+
+msgid "plugins.generic.magicLogin.webauthn.login.button"
+msgstr "Continue"

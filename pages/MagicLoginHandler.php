@@ -11,12 +11,16 @@
  *
  * Security model summary
  * ─────────────────────
- *  • CSRF enforced on every mutating request via PKP's checkCSRF().
+ *  • CSRF enforced unconditionally on every mutating request via
+ *    PKP's checkCSRF() -- including requests from an already-logged-in
+ *    session, which is what prevents login-CSRF (an attacker's own
+ *    valid token being auto-submitted by a logged-in victim's browser).
  *  • Token format validated (regex) before any DB access.
  *  • Per-IP sliding-window rate limits: /send (5/10 min), /login (10/5 min).
  *  • Per-account minimum interval enforced in TokenService (independent of IP).
  *  • Neutral /send response prevents user-account enumeration.
- *  • Token consumed before session creation (single-use guarantee).
+ *  • Token verified and consumed atomically (single DB transaction) before
+ *    session creation (single-use guarantee, race-safe under concurrency).
  *  • Session ID regenerated on login (anti session-fixation, SessionService).
  *  • Cache-Control: no-store + Referrer-Policy: no-referrer on /confirm (token
  *    in query string must not be cached or sent in referer).
@@ -30,7 +34,11 @@ use APP\facades\Repo;
 use APP\handler\Handler;
 use APP\plugins\generic\magicLogin\classes\SessionService;
 use APP\plugins\generic\magicLogin\classes\TokenService;
+use APP\plugins\generic\magicLogin\classes\TotpAccountService;
+use APP\plugins\generic\magicLogin\classes\webauthn\WebAuthnCeremony;
+use APP\plugins\generic\magicLogin\classes\webauthn\WebAuthnCredentialService;
 use APP\plugins\generic\magicLogin\mailables\MagicLoginLink;
+use APP\plugins\generic\magicLogin\MagicLoginPlugin;
 use APP\template\TemplateManager;
 use Illuminate\Support\Facades\Mail;
 use PKP\core\Registry;
@@ -51,6 +59,39 @@ class MagicLoginHandler extends Handler
     private const RL_SEND_WIN  = 600; // 10 minutes
     private const RL_LOGIN_MAX = 10;  // max /login POST attempts per IP per window
     private const RL_LOGIN_WIN = 300; // 5 minutes
+
+    // TOTP (authenticator-app code) alternative sign-in — per-IP AND
+    // per-account limits, since a 6-digit code has far less entropy than the
+    // magic-link token and must be brute-force resistant from both angles.
+    private const RL_TOTP_IP_MAX      = 10;  // max /totpLogin POST attempts per IP per window
+    private const RL_TOTP_IP_WIN      = 300; // 5 minutes
+    private const RL_TOTP_ACCOUNT_MAX = 8;   // max attempts per *account* per window, any IP
+    private const RL_TOTP_ACCOUNT_WIN = 900; // 15 minutes
+
+    /** Identifier field on the TOTP alt-login form: username or email. */
+    private const TOTP_IDENTIFIER_MAX_LEN = 254;
+    /** 6-digit authenticator code. */
+    private const TOTP_CODE_PATTERN = '/^\d{6}$/';
+
+    // WebAuthn (passkey) sign-in — same per-IP/per-account dual-limit
+    // posture as TOTP, since options/verify are also unauthenticated
+    // endpoints an attacker could otherwise hammer.
+    private const RL_WEBAUTHN_IP_MAX      = 10;
+    private const RL_WEBAUTHN_IP_WIN      = 300;
+    private const RL_WEBAUTHN_ACCOUNT_MAX = 8;
+    private const RL_WEBAUTHN_ACCOUNT_WIN = 900;
+    /** Registered credentials per account — a generous ceiling, not a real limit. */
+    private const WEBAUTHN_MAX_CREDENTIALS_PER_USER = 10;
+    /** Pending challenge TTL — long enough for a user to complete a biometric/PIN prompt. */
+    private const WEBAUTHN_CHALLENGE_TTL_SEC = 120;
+    private const WEBAUTHN_SESSION_REG_KEY = 'magicLoginWebauthnRegChallenge';
+    private const WEBAUTHN_SESSION_LOGIN_KEY = 'magicLoginWebauthnLoginChallenge';
+
+    // Minimum wall-clock duration (seconds) the email-lookup branch of /send
+    // must take before responding, so a matched email (DB writes + a
+    // synchronous mail send) and an unmatched one (near-instant) are not
+    // distinguishable by response timing.
+    private const SEND_MIN_DURATION_SEC = 0.35;
 
     public function authorize($request, &$args, $roleAssignments)
     {
@@ -88,30 +129,48 @@ class MagicLoginHandler extends Handler
         $plugin = $this->plugin();
         $plugin->ensureEnabled($request);
 
-        $ip = $this->clientIp();
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
 
         // Per-IP rate limit prevents one IP from flooding many accounts.
         if (!self::withinRateLimit('send', $ip, self::RL_SEND_MAX, self::RL_SEND_WIN)) {
             error_log("[magicLogin] SEND_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'SEND_RATELIMIT', null, $ip);
             // Show the same neutral message so the IP can't confirm the limit was hit.
             $this->showNeutralSentPage($request, $plugin);
             return;
         }
 
-        $context = $request->getContext();
-        $email   = $this->sanitizeEmail((string) $request->getUserVar('email'));
+        $email = $this->sanitizeEmail((string) $request->getUserVar('email'));
+
+        // Timed from here so the matched and unmatched branches below can be
+        // normalized to the same minimum wall-clock duration (timing
+        // side-channel mitigation — see SEND_MIN_DURATION_SEC).
+        $branchStart = microtime(true);
 
         if ($email !== null) {
             $user = Repo::user()->getByEmail($email, false); // active users only
             if ($user && !$user->getDisabled()) {
-                $ttl   = $plugin->ttlSeconds($context->getId());
-                $token = (new TokenService())->issue($user, $ttl, $plugin->minIntervalSeconds($context->getId()));
+                $ttl   = $plugin->ttlSeconds($contextId);
+                $token = (new TokenService())->issue($user, $ttl, $plugin->minIntervalSeconds($contextId));
                 if ($token) {
-                    $this->emailLink($user, $token, $context, $request, (int) round($ttl / 60));
-                    error_log("[magicLogin] LINK_SENT user_id={$user->getId()} ip={$ip}");
+                    if ($this->emailLink($user, $token, $context, $request, (int) round($ttl / 60))) {
+                        error_log("[magicLogin] LINK_SENT user_id={$user->getId()} ip={$ip}");
+                        $this->recordAttempt($contextId, 'LINK_SENT', $user->getId(), $ip);
+                    } else {
+                        error_log("[magicLogin] LINK_SEND_FAILED user_id={$user->getId()} ip={$ip}");
+                        $this->recordAttempt($contextId, 'LINK_SEND_FAILED', $user->getId(), $ip);
+                    }
                 }
+            } else {
+                $this->performDummySendWork();
             }
+        } else {
+            $this->performDummySendWork();
         }
+
+        $this->normalizeSendTiming($branchStart);
 
         // Always identical response — no account enumeration.
         $this->showNeutralSentPage($request, $plugin);
@@ -165,9 +224,12 @@ class MagicLoginHandler extends Handler
     }
 
     /**
-     * POST: verify the token, consume it, then establish the session.
-     * Token consumption happens before session creation so a failure in session
-     * setup does not leave a live token that could be replayed.
+     * POST: atomically verify + consume the token, then establish the session.
+     * Verification and consumption happen in a single DB transaction (see
+     * TokenService::verifyAndConsume()) so concurrent requests presenting the
+     * same token cannot both succeed, and consumption happens before session
+     * creation so a failure in session setup does not leave a live token that
+     * could be replayed.
      */
     public function login($args, $request): void
     {
@@ -176,11 +238,14 @@ class MagicLoginHandler extends Handler
         }
         $this->plugin()->ensureEnabled($request);
 
-        $ip = $this->clientIp();
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
 
         // Per-IP rate limit on verify attempts.
         if (!self::withinRateLimit('login', $ip, self::RL_LOGIN_MAX, self::RL_LOGIN_WIN)) {
             error_log("[magicLogin] LOGIN_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'LOGIN_RATELIMIT', null, $ip);
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.rateLimit'));
             return;
         }
@@ -189,34 +254,610 @@ class MagicLoginHandler extends Handler
 
         if ($token === null) {
             error_log("[magicLogin] LOGIN_FAIL ip={$ip} reason=malformed_token");
+            $this->recordAttempt($contextId, 'LOGIN_FAIL', null, $ip, 'malformed_token');
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.invalid'));
             return;
         }
 
         $service = new TokenService();
-        $user    = $service->verify($token);
+        // Verify and consume atomically (single transaction): guarantees a
+        // token can be turned into a live session at most once, even under
+        // concurrent requests presenting the same token.
+        $user = $service->verifyAndConsume($token);
 
         if (!$user) {
             error_log("[magicLogin] LOGIN_FAIL ip={$ip} reason=invalid_or_expired_token");
+            $this->recordAttempt($contextId, 'LOGIN_FAIL', null, $ip, 'invalid_or_expired_token');
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.invalid'));
             return;
         }
 
-        // Consume BEFORE session creation — token is dead whether or not the
-        // session succeeds, so there is no replay window.
-        $service->consume($user);
-
         if (SessionService::establishSession($user, 'magicLogin')) {
             error_log("[magicLogin] LOGIN_SUCCESS user_id={$user->getId()} ip={$ip}");
+            $this->recordAttempt($contextId, 'LOGIN_SUCCESS', $user->getId(), $ip);
             $request->redirect(null, 'dashboard');
         }
 
         // Session establishment returned false (account disabled between token issue and use).
         error_log("[magicLogin] LOGIN_FAIL ip={$ip} user_id={$user->getId()} reason=session_failed");
+        $this->recordAttempt($contextId, 'LOGIN_FAIL', $user->getId(), $ip, 'session_failed');
         $request->redirect(null, 'magicLogin', 'request');
     }
 
+    // ── TOTP: alternative sign-in (authenticator-app code) ───────────────────
+    //
+    // This is an ALTERNATIVE to the magic-link flow, not a second factor
+    // layered on top of it: a user with TOTP enabled can sign in with either
+    // "email me a link" (above) OR a 6-digit authenticator code, their
+    // choice. Combining both into mandatory 2FA was considered and rejected
+    // here — see README.md "TOTP alternative sign-in" for the full reasoning
+    // (this plugin's whole premise is
+    // reducing friction; forcing every magic-link user to also hold a code
+    // would silently turn "alternative" into "mandatory 2FA" for anyone who
+    // ever enables TOTP, which is a bigger behavioural change than asked for).
+
+    /** GET: show the "enter your authenticator code" alternative sign-in form. */
+    public function totp($args, $request): void
+    {
+        if (Validation::isLoggedIn()) {
+            $request->redirect(null, 'dashboard');
+        }
+        $this->plugin()->ensureEnabled($request);
+
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+        $templateMgr->assign('totpLoginUrl',
+            $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpLogin')
+        );
+        $templateMgr->display($this->plugin()->getTemplateResource('totp.tpl'));
+    }
+
+    /** GET: the "sign in with a passkey" page. */
+    public function webauthnLogin($args, $request): void
+    {
+        if (Validation::isLoggedIn()) {
+            $request->redirect(null, 'dashboard');
+        }
+        $this->plugin()->ensureEnabled($request);
+
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+        $templateMgr->assign([
+            'webauthnLoginOptionsUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnLoginOptions'),
+            'webauthnLoginVerifyUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnLoginVerify'),
+        ]);
+        $templateMgr->addJavaScript(
+            'magicLoginWebauthn',
+            $request->getBaseUrl() . '/' . $this->plugin()->getPluginPath() . '/js/webauthn.js'
+        );
+        $templateMgr->display($this->plugin()->getTemplateResource('webauthnLogin.tpl'));
+    }
+
+    /**
+     * POST: verify a TOTP code and, if it matches an enabled account, sign in.
+     * Same neutral-error posture as the magic-link flow: a wrong identifier,
+     * an account without TOTP enabled, and a wrong code all produce the same
+     * generic error message, so this endpoint cannot be used to enumerate
+     * which accounts have TOTP enabled.
+     */
+    public function totpLogin($args, $request): void
+    {
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totp');
+        }
+        $plugin = $this->plugin();
+        $plugin->ensureEnabled($request);
+
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
+
+        if (!self::withinKeyedRateLimit('totpip', $ip, self::RL_TOTP_IP_MAX, self::RL_TOTP_IP_WIN)) {
+            error_log("[magicLogin] TOTP_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'TOTP_RATELIMIT', null, $ip);
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $identifier = $this->sanitizeTotpIdentifier((string) $request->getUserVar('identifier'));
+        $code       = $this->sanitizeTotpCode((string) $request->getUserVar('code'));
+
+        if ($identifier === null || $code === null) {
+            error_log("[magicLogin] TOTP_FAIL ip={$ip} reason=malformed_input");
+            $this->recordAttempt($contextId, 'TOTP_FAIL', null, $ip, 'malformed_input');
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.invalid'));
+            return;
+        }
+
+        // Per-account rate limit too: an attacker who already knows (or
+        // guesses) one victim's username/email must still be throttled even
+        // if they spread attempts across many IPs.
+        $accountKey = hash('sha256', strtolower($identifier));
+        if (!self::withinKeyedRateLimit('totpacct', $accountKey, self::RL_TOTP_ACCOUNT_MAX, self::RL_TOTP_ACCOUNT_WIN)) {
+            error_log("[magicLogin] TOTP_RATELIMIT ip={$ip} scope=account");
+            $this->recordAttempt($contextId, 'TOTP_RATELIMIT', null, $ip);
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $user = Repo::user()->getByUsername($identifier, false)
+            ?: Repo::user()->getByEmail($identifier, false);
+
+        $verified = false;
+        if ($user && !$user->getDisabled()) {
+            $verified = (new TotpAccountService())->verifyLoginCode($user, $code);
+        }
+
+        if (!$verified) {
+            error_log("[magicLogin] TOTP_FAIL ip={$ip} reason=invalid_code");
+            $this->recordAttempt($contextId, 'TOTP_FAIL', $user ? $user->getId() : null, $ip, 'invalid_code');
+            $this->showTotpError($request, __('plugins.generic.magicLogin.error.invalid'));
+            return;
+        }
+
+        if (SessionService::establishSession($user, 'magicLoginTotp')) {
+            error_log("[magicLogin] TOTP_LOGIN_SUCCESS user_id={$user->getId()} ip={$ip}");
+            $this->recordAttempt($contextId, 'TOTP_LOGIN_SUCCESS', $user->getId(), $ip);
+            $request->redirect(null, 'dashboard');
+        }
+
+        error_log("[magicLogin] TOTP_FAIL ip={$ip} user_id={$user->getId()} reason=session_failed");
+        $this->recordAttempt($contextId, 'TOTP_FAIL', $user->getId(), $ip, 'session_failed');
+        $this->showTotpError($request, __('plugins.generic.magicLogin.error.invalid'));
+    }
+
+    // ── TOTP: self-service enable / disable (logged-in user only) ────────────
+
+    /** GET: the logged-in user's own TOTP settings page. */
+    public function totpSetup($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        $this->renderTotpSetup($request, $user);
+    }
+
+    /**
+     * POST: confirm a pending TOTP setup by proving possession of the secret
+     * (entering one valid code) before it is enabled.
+     */
+    public function totpConfirm($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totpSetup');
+        }
+
+        $ip   = $this->clientIp();
+        $code = $this->sanitizeTotpCode((string) $request->getUserVar('code'));
+
+        if ($code === null || !(new TotpAccountService())->confirmSetup($user, $code)) {
+            error_log("[magicLogin] TOTP_ENABLE_FAIL ip={$ip} user_id={$user->getId()}");
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.totpSetup.error.confirm'));
+            return;
+        }
+
+        error_log("[magicLogin] TOTP_ENABLED ip={$ip} user_id={$user->getId()}");
+        $this->renderTotpSetup($request, $user, null, __('plugins.generic.magicLogin.totpSetup.enabled'));
+    }
+
+    /**
+     * POST: disable TOTP for the current account. Requires the account's
+     * current password to be re-entered (re-authentication) — a logged-in
+     * session (e.g. a hijacked or shared browser session) is not by itself
+     * sufficient authority to turn off a security feature on the account.
+     */
+    public function totpDisable($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totpSetup');
+        }
+
+        $ip       = $this->clientIp();
+        $password = (string) $request->getUserVar('password');
+
+        if (!self::withinKeyedRateLimit('totpdisable', hash('sha256', (string) $user->getId()), self::RL_TOTP_ACCOUNT_MAX, self::RL_TOTP_ACCOUNT_WIN)) {
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $reason = null;
+        if ($password === '' || !Validation::checkCredentials($user->getUsername(), $password, $reason)) {
+            error_log("[magicLogin] TOTP_DISABLE_FAIL ip={$ip} user_id={$user->getId()} reason=bad_password");
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.totpSetup.error.password'));
+            return;
+        }
+
+        (new TotpAccountService())->disable($user->getId());
+        error_log("[magicLogin] TOTP_DISABLED ip={$ip} user_id={$user->getId()}");
+        $this->renderTotpSetup($request, $user, null, __('plugins.generic.magicLogin.totpSetup.disabled'));
+    }
+
+    // ── WebAuthn (passkey): self-service registration (logged-in user only) ──
+
+    /**
+     * GET: PublicKeyCredentialCreationOptions for registering a new passkey
+     * on the current account. The challenge is stored server-side in the
+     * session (never trust a challenge the client claims to have received)
+     * keyed to this user, single-use, short TTL.
+     */
+    public function webauthnRegisterOptions($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        $service = new WebAuthnCredentialService();
+
+        if ($service->countForUser($user->getId()) >= self::WEBAUTHN_MAX_CREDENTIALS_PER_USER) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.webauthn.error.tooMany')], 400);
+            return;
+        }
+
+        $challenge = random_bytes(32);
+        $request->getSession()->put(self::WEBAUTHN_SESSION_REG_KEY, [
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'userId' => $user->getId(),
+            'expires' => time() + self::WEBAUTHN_CHALLENGE_TTL_SEC,
+        ]);
+
+        $existing = $service->listForUser($user->getId());
+        $excludeCredentials = array_map(static fn ($row) => [
+            'type' => 'public-key',
+            'id' => $row->credential_id,
+        ], $existing);
+
+        $this->jsonResponse([
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'rp' => ['name' => (string) ($request->getContext() ? $request->getContext()->getLocalizedData('name') : 'OJS'), 'id' => $this->rpId($request)],
+            'user' => [
+                'id' => WebAuthnCeremony::b64urlEncode((string) $user->getId()),
+                'name' => $user->getUsername(),
+                'displayName' => (string) $user->getFullName(),
+            ],
+            'pubKeyCredParams' => [
+                ['type' => 'public-key', 'alg' => -7],
+                ['type' => 'public-key', 'alg' => -257],
+            ],
+            'timeout' => self::WEBAUTHN_CHALLENGE_TTL_SEC * 1000,
+            'attestation' => 'none',
+            'excludeCredentials' => $excludeCredentials,
+            // residentKey 'required' stores the credential ON the
+            // authenticator/device (a "discoverable credential"), which is
+            // what lets sign-in skip asking for a username — the browser
+            // can list a device's resident passkeys for this RP without
+            // being told in advance who's signing in. requireResidentKey is
+            // the older (Level 1) form of the same request, included for
+            // browsers that don't yet read residentKey.
+            'authenticatorSelection' => [
+                'userVerification' => 'preferred',
+                'residentKey' => 'required',
+                'requireResidentKey' => true,
+            ],
+        ]);
+    }
+
+    /** POST: verify a registration ceremony response and store the new credential. */
+    public function webauthnRegisterVerify($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $this->jsonResponse(['error' => __('form.csrfInvalid')], 403);
+            return;
+        }
+
+        $pending = $request->getSession()->get(self::WEBAUTHN_SESSION_REG_KEY);
+        if (!is_array($pending) || (int) ($pending['expires'] ?? 0) < time() || (int) ($pending['userId'] ?? 0) !== (int) $user->getId()) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.webauthn.error.expired')], 400);
+            return;
+        }
+
+        $credential = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($credential)) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        try {
+            $result = WebAuthnCeremony::verifyRegistration($credential, (string) $pending['challenge'], $this->origin($request), $this->rpId($request));
+        } catch (\Throwable $e) {
+            error_log('[magicLogin] WEBAUTHN_REGISTER_FAIL user_id=' . $user->getId() . ' reason=' . $e->getMessage());
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.webauthn.error.registerFailed')], 400);
+            return;
+        }
+
+        $request->getSession()->forget(self::WEBAUTHN_SESSION_REG_KEY);
+
+        $service = new WebAuthnCredentialService();
+        if ($service->findByCredentialId($result['credentialId'])) {
+            // Same authenticator registered twice (e.g. a double-submitted
+            // request) — treat as success rather than a confusing duplicate-key error.
+            $this->jsonResponse(['ok' => true]);
+            return;
+        }
+
+        $nickname = trim((string) $request->getUserVar('nickname'));
+        $service->store(
+            $user->getId(),
+            $result['credentialId'],
+            $result['publicKeyPem'],
+            $result['alg'],
+            $result['transports'],
+            $result['aaguid'],
+            $nickname !== '' ? mb_substr($nickname, 0, 191) : null
+        );
+
+        error_log('[magicLogin] WEBAUTHN_REGISTERED user_id=' . $user->getId());
+        $this->jsonResponse(['ok' => true]);
+    }
+
+    /** POST: remove a registered passkey. Requires password re-entry, same posture as totpDisable(). */
+    public function webauthnDelete($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totpSetup');
+        }
+
+        $ip = $this->clientIp();
+        $credentialRecordId = (int) $request->getUserVar('credentialRecordId');
+        $password = (string) $request->getUserVar('password');
+
+        if (!self::withinKeyedRateLimit('webauthndelete', hash('sha256', (string) $user->getId()), self::RL_TOTP_ACCOUNT_MAX, self::RL_TOTP_ACCOUNT_WIN)) {
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $reason = null;
+        if ($password === '' || !Validation::checkCredentials($user->getUsername(), $password, $reason)) {
+            error_log("[magicLogin] WEBAUTHN_DELETE_FAIL ip={$ip} user_id={$user->getId()} reason=bad_password");
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.totpSetup.error.password'));
+            return;
+        }
+
+        $deleted = (new WebAuthnCredentialService())->delete($credentialRecordId, $user->getId());
+        error_log("[magicLogin] WEBAUTHN_DELETED ip={$ip} user_id={$user->getId()} credential_record_id={$credentialRecordId} ok=" . ($deleted ? '1' : '0'));
+        $this->renderTotpSetup($request, $user, $deleted ? null : __('plugins.generic.magicLogin.error.invalid'), $deleted ? __('plugins.generic.magicLogin.webauthn.removed') : null);
+    }
+
+    // ── WebAuthn (passkey): sign-in (unauthenticated) ─────────────────────────
+
+    /**
+     * POST: PublicKeyCredentialRequestOptions for a usernameless (discoverable
+     * credential) sign-in — no identifier is collected. `allowCredentials` is
+     * intentionally left empty so the browser/authenticator surfaces every
+     * resident passkey it holds for this RP; the response's `userHandle`
+     * (the account's user ID, embedded at registration time) is how
+     * webauthnLoginVerify() learns who is signing in — see
+     * WEBAUTHN_MAX_CREDENTIALS_PER_USER's registration path, which requests
+     * `residentKey: 'required'` for exactly this reason.
+     */
+    public function webauthnLoginOptions($args, $request): void
+    {
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $this->jsonResponse(['error' => __('form.csrfInvalid')], 403);
+            return;
+        }
+        $this->plugin()->ensureEnabled($request);
+
+        $ip = $this->clientIp();
+        $context = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
+
+        if (!self::withinKeyedRateLimit('webauthnip', $ip, self::RL_WEBAUTHN_IP_MAX, self::RL_WEBAUTHN_IP_WIN)) {
+            error_log("[magicLogin] WEBAUTHN_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'WEBAUTHN_RATELIMIT', null, $ip);
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.rateLimit')], 429);
+            return;
+        }
+
+        $challenge = random_bytes(32);
+        $request->getSession()->put(self::WEBAUTHN_SESSION_LOGIN_KEY, [
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'expires' => time() + self::WEBAUTHN_CHALLENGE_TTL_SEC,
+        ]);
+
+        $this->jsonResponse([
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'rpId' => $this->rpId($request),
+            'timeout' => self::WEBAUTHN_CHALLENGE_TTL_SEC * 1000,
+            'userVerification' => 'preferred',
+            // Empty on purpose — see method docblock.
+            'allowCredentials' => [],
+        ]);
+    }
+
+    /** POST: verify an authentication ceremony response and, on success, sign in. */
+    public function webauthnLoginVerify($args, $request): void
+    {
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $this->jsonResponse(['error' => __('form.csrfInvalid')], 403);
+            return;
+        }
+
+        $ip = $this->clientIp();
+        $context = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
+
+        $pending = $request->getSession()->get(self::WEBAUTHN_SESSION_LOGIN_KEY);
+        if (!is_array($pending) || (int) ($pending['expires'] ?? 0) < time()) {
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', null, $ip, 'no_pending_challenge');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        $credential = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($credential)) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        // Usernameless flow: the account is identified entirely by which
+        // stored credential's ID the authenticator returned — there is no
+        // pre-known candidate user to cross-check against (unlike the old
+        // identifier-first flow). userHandle (set to the user ID at
+        // registration) is a second, independent confirmation of the same
+        // fact, not the primary lookup — the credential row itself already
+        // pins the account.
+        $credentialId = (string) ($credential['id'] ?? '');
+        $stored = $credentialId !== '' ? (new WebAuthnCredentialService())->findByCredentialId($credentialId) : null;
+        $userHandle = isset($credential['response']['userHandle'])
+            ? WebAuthnCeremony::b64urlDecode((string) $credential['response']['userHandle'])
+            : null;
+
+        $user = $stored ? Repo::user()->get((int) $stored->user_id) : null;
+
+        if (!$user || $user->getDisabled() || !$stored
+            || ($userHandle !== null && $userHandle !== (string) $user->getId())
+        ) {
+            error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} reason=unknown_credential");
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user ? $user->getId() : null, $ip, 'unknown_credential');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        // Per-account rate limit, checked now that the credential has told
+        // us which account this is (the usernameless flow has no earlier
+        // point to check this against).
+        if (!self::withinKeyedRateLimit('webauthnacct', hash('sha256', (string) $user->getId()), self::RL_WEBAUTHN_ACCOUNT_MAX, self::RL_WEBAUTHN_ACCOUNT_WIN)) {
+            error_log("[magicLogin] WEBAUTHN_RATELIMIT ip={$ip} scope=account");
+            $this->recordAttempt($contextId, 'WEBAUTHN_RATELIMIT', $user->getId(), $ip);
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.rateLimit')], 429);
+            return;
+        }
+
+        try {
+            $result = WebAuthnCeremony::verifyAssertion($credential, (string) $pending['challenge'], $this->origin($request), $this->rpId($request), $stored->public_key_pem);
+        } catch (\Throwable $e) {
+            error_log('[magicLogin] WEBAUTHN_FAIL ip=' . $ip . ' user_id=' . $user->getId() . ' reason=' . $e->getMessage());
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user->getId(), $ip, 'verify_failed');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        // Anti-clone signal (spec section 6.1.1): a cloned authenticator
+        // replays an old counter value. Authenticators that don't implement
+        // a counter always report 0 — only enforce strictly-increasing when
+        // the authenticator has ever reported a nonzero count.
+        $service = new WebAuthnCredentialService();
+        if ($stored->sign_count > 0 && $result['signCount'] > 0 && $result['signCount'] <= (int) $stored->sign_count) {
+            error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} user_id={$user->getId()} reason=sign_count_replay");
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user->getId(), $ip, 'sign_count_replay');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        $request->getSession()->forget(self::WEBAUTHN_SESSION_LOGIN_KEY);
+        $service->updateSignCount((int) $stored->credential_record_id, $result['signCount']);
+
+        if (SessionService::establishSession($user, 'webauthn')) {
+            error_log("[magicLogin] WEBAUTHN_LOGIN_SUCCESS user_id={$user->getId()} ip={$ip}");
+            $this->recordAttempt($contextId, 'WEBAUTHN_LOGIN_SUCCESS', $user->getId(), $ip);
+            $this->jsonResponse(['ok' => true, 'redirect' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'dashboard')]);
+            return;
+        }
+
+        error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} user_id={$user->getId()} reason=session_failed");
+        $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user->getId(), $ip, 'session_failed');
+        $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+    }
+
+    /**
+     * Render the logged-in user's TOTP settings page. If TOTP is not
+     * currently enabled, (re)generates a pending secret so the page always
+     * shows a fresh QR code + otpauth:// URI + manual-entry secret to set up
+     * against. See totpSetup.tpl / README for the "text entry instead
+     * of a rendered QR image" judgement call.
+     */
+    private function renderTotpSetup($request, $user, ?string $error = null, ?string $success = null): void
+    {
+        $service = new TotpAccountService();
+        $context = $request->getContext();
+
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+
+        $enabled = $service->isEnabled($user->getId());
+        $templateMgr->assign([
+            'totpEnabled'    => $enabled,
+            'totpConfirmUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpConfirm'),
+            'totpDisableUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpDisable'),
+            'error'          => $error,
+            'success'        => $success,
+        ]);
+
+        if (!$enabled) {
+            $issuer = $context ? $context->getLocalizedData('name') : 'OJS';
+            $setup  = $service->getOrCreatePendingSetup($user, (string) $issuer);
+            $templateMgr->assign([
+                'totpSecret' => $setup['secret'],
+                'totpUri'    => $setup['uri'],
+            ]);
+            // Vendored davidshimjs/qrcodejs (MIT, no dependencies) — renders
+            // the otpauth:// URI as a real scannable QR client-side. See
+            // README: hand-rolling QR encoding ourselves was ruled out as
+            // too error-prone; using a small, well-established existing
+            // library instead of a from-scratch implementation resolves
+            // that concern without adding a server-side/PHP dependency.
+            $templateMgr->addJavaScript(
+                'magicLoginQrLib',
+                $request->getBaseUrl() . '/' . $this->plugin()->getPluginPath() . '/js/qrcode.js'
+            );
+        }
+
+        $credentials = (new WebAuthnCredentialService())->listForUser($user->getId());
+        $templateMgr->assign([
+            'webauthnCredentials' => array_map(static function ($row) {
+                return [
+                    'id' => (int) $row->credential_record_id,
+                    'nickname' => $row->nickname,
+                    'createdAt' => $row->created_at,
+                    'lastUsedAt' => $row->last_used_at,
+                ];
+            }, $credentials),
+            'webauthnCanAddMore' => count($credentials) < self::WEBAUTHN_MAX_CREDENTIALS_PER_USER,
+            'webauthnRegisterOptionsUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnRegisterOptions'),
+            'webauthnRegisterVerifyUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnRegisterVerify'),
+            'webauthnDeleteUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnDelete'),
+        ]);
+        $templateMgr->addJavaScript(
+            'magicLoginWebauthn',
+            $request->getBaseUrl() . '/' . $this->plugin()->getPluginPath() . '/js/webauthn.js'
+        );
+
+        $templateMgr->display($this->plugin()->getTemplateResource('totpSetup.tpl'));
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Append an event to the capped, per-context "recent activity" list shown
+     * in the plugin's Settings panel (admin-facing visibility only).
+     *
+     * This is a best-effort log, not a security control: it is read-modify-
+     * write against a single plugin setting row rather than an append-only
+     * table, so a lost update under concurrent requests is a cosmetic
+     * (missing) log entry, never a false one and never something a security
+     * decision depends on. Failures here must never break the login flow.
+     */
+    private function recordAttempt(int $contextId, string $event, ?int $userId, string $ip, ?string $reason = null): void
+    {
+        try {
+            $plugin = $this->plugin();
+            $raw    = (string) $plugin->getSetting($contextId, MagicLoginPlugin::RECENT_ATTEMPTS_SETTING);
+            $events = $raw !== '' ? json_decode($raw, true) : [];
+            if (!is_array($events)) {
+                $events = [];
+            }
+            array_unshift($events, [
+                'ts'      => time(),
+                'event'   => $event,
+                'user_id' => $userId,
+                'ip'      => $ip,
+                'reason'  => $reason,
+            ]);
+            $events = array_slice($events, 0, MagicLoginPlugin::RECENT_ATTEMPTS_MAX);
+            $plugin->updateSetting($contextId, MagicLoginPlugin::RECENT_ATTEMPTS_SETTING, json_encode($events), 'string');
+        } catch (\Throwable $e) {
+            error_log('[magicLogin] recordAttempt failed (non-fatal): ' . $e->getMessage());
+        }
+    }
 
     private function showNeutralSentPage($request, $plugin): void
     {
@@ -226,12 +867,137 @@ class MagicLoginHandler extends Handler
         $templateMgr->display($plugin->getTemplateResource('request.tpl'));
     }
 
+    private function showTotpError($request, string $message): void
+    {
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+        $templateMgr->assign([
+            'error'       => $message,
+            'totpLoginUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpLogin'),
+        ]);
+        $templateMgr->display($this->plugin()->getTemplateResource('totp.tpl'));
+    }
+
+    /**
+     * Require an active, logged-in session before serving a TOTP self-service
+     * account page. Not a full PKP authorization-policy chain (this handler
+     * predates that here and the rest of the class doesn't use one either),
+     * but the same check OJS's own account pages rely on: no session, no page.
+     */
+    private function requireLoggedInUser($request)
+    {
+        if (!Validation::isLoggedIn()) {
+            $request->redirect(null, 'login', 'signIn');
+        }
+        $user = $request->getUser();
+        if (!$user) {
+            $request->redirect(null, 'login', 'signIn');
+        }
+        return $user;
+    }
+
+    /**
+     * Validate the identifier (username or email) field on the TOTP
+     * alternative-login form. Returns the trimmed value or null.
+     */
+    private function sanitizeTotpIdentifier(string $raw): ?string
+    {
+        $value = trim($raw);
+        if ($value === '' || strlen($value) > self::TOTP_IDENTIFIER_MAX_LEN) {
+            return null;
+        }
+        return $value;
+    }
+
+    /** Validate a 6-digit authenticator code. Returns the code unchanged or null. */
+    private function sanitizeTotpCode(string $raw): ?string
+    {
+        $code = trim($raw);
+        return preg_match(self::TOTP_CODE_PATTERN, $code) === 1 ? $code : null;
+    }
+
+    /**
+     * File-based sliding-window rate limiter keyed by an arbitrary safe
+     * string (IP address OR a hashed account identifier), reusing exactly
+     * the same lock-file / sliding-window pattern as withinRateLimit() below
+     * — duplicated rather than refactored in place so the already-reviewed
+     * magic-link rate limiter is not touched by this change.
+     */
+    private static function withinKeyedRateLimit(string $action, string $key, int $max, int $windowSecs): bool
+    {
+        $dir = BASE_SYS_DIR . '/cache/_rl';
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+        }
+        $safeAction = preg_replace('/[^a-z]/i', '', $action);
+        $safeKey    = preg_replace('/[^0-9a-fA-F]/', '_', $key);
+        $file       = "{$dir}/ml_{$safeAction}_{$safeKey}.json";
+
+        $handle = @fopen($file, 'c+');
+        if ($handle === false) {
+            return true; // fail open rather than block all logins on a filesystem hiccup
+        }
+
+        try {
+            if (!flock($handle, LOCK_EX)) {
+                return true;
+            }
+
+            $now  = time();
+            $raw  = stream_get_contents($handle);
+            $hits = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+            $hits = array_values(array_filter($hits, static fn($t) => is_int($t) && $t > $now - $windowSecs));
+
+            if (count($hits) >= $max) {
+                flock($handle, LOCK_UN);
+                return false;
+            }
+            $hits[] = $now;
+
+            ftruncate($handle, 0);
+            rewind($handle);
+            fwrite($handle, json_encode($hits));
+            fflush($handle);
+            flock($handle, LOCK_UN);
+            return true;
+        } finally {
+            fclose($handle);
+        }
+    }
+
     private function showConfirmError($request, string $message): void
     {
         $templateMgr = TemplateManager::getManager($request);
         $this->registerAssets($templateMgr, $request);
         $templateMgr->assign('error', $message);
         $templateMgr->display($this->plugin()->getTemplateResource('confirm.tpl'));
+    }
+
+    /**
+     * Equivalent-cost dummy work for the "no match" branch of /send: performs
+     * the same shape of work as TokenService::issue() (random byte generation
+     * + hashing) without touching the database, so a profiler/timer can't
+     * trivially distinguish "no account" from "account found, doing real work".
+     */
+    private function performDummySendWork(): void
+    {
+        $dummySelector = bin2hex(random_bytes(16));
+        $dummyVerifier = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+        hash('sha256', $dummyVerifier . $dummySelector);
+    }
+
+    /**
+     * Pads the elapsed time of the /send email-lookup branch up to
+     * SEND_MIN_DURATION_SEC, so neither branch returns fast enough to leak
+     * whether the submitted email matched an account.
+     */
+    private function normalizeSendTiming(float $branchStart): void
+    {
+        $elapsed   = microtime(true) - $branchStart;
+        $remaining = self::SEND_MIN_DURATION_SEC - $elapsed;
+        if ($remaining > 0) {
+            usleep((int) round($remaining * 1_000_000));
+        }
     }
 
     /**
@@ -265,6 +1031,11 @@ class MagicLoginHandler extends Handler
      * File-based sliding-window per-IP rate limiter.
      * Stores per-action hit timestamps in cache/_rl/ml_{action}_{ip}.json.
      * Returns true if the request is within the limit, false if it is exceeded.
+     *
+     * The entire read-modify-write cycle (read hits, purge stale ones, count,
+     * decide, append, write) is held under a single exclusive flock so two
+     * concurrent requests from the same IP cannot both read the same stale
+     * hit-count and both pass the check.
      */
     private static function withinRateLimit(string $action, string $ip, int $max, int $windowSecs): bool
     {
@@ -277,21 +1048,39 @@ class MagicLoginHandler extends Handler
         $safeIp     = preg_replace('/[^0-9a-fA-F.:]/i', '_', $ip);
         $file       = "{$dir}/ml_{$safeAction}_{$safeIp}.json";
 
-        $now  = time();
-        $hits = [];
-        if (is_file($file)) {
-            $raw  = @file_get_contents($file);
-            $hits = is_string($raw) ? (json_decode($raw, true) ?: []) : [];
+        $handle = @fopen($file, 'c+');
+        if ($handle === false) {
+            // Cannot open the counter file at all — fail open rather than
+            // block all logins on a filesystem hiccup.
+            return true;
         }
-        // Purge hits that have slid out of the window.
-        $hits = array_values(array_filter($hits, static fn($t) => is_int($t) && $t > $now - $windowSecs));
 
-        if (count($hits) >= $max) {
-            return false;
+        try {
+            if (!flock($handle, LOCK_EX)) {
+                return true;
+            }
+
+            $now = time();
+            $raw = stream_get_contents($handle);
+            $hits = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+            // Purge hits that have slid out of the window.
+            $hits = array_values(array_filter($hits, static fn($t) => is_int($t) && $t > $now - $windowSecs));
+
+            if (count($hits) >= $max) {
+                flock($handle, LOCK_UN);
+                return false;
+            }
+            $hits[] = $now;
+
+            ftruncate($handle, 0);
+            rewind($handle);
+            fwrite($handle, json_encode($hits));
+            fflush($handle);
+            flock($handle, LOCK_UN);
+            return true;
+        } finally {
+            fclose($handle);
         }
-        $hits[] = $now;
-        @file_put_contents($file, json_encode($hits), LOCK_EX);
-        return true;
     }
 
     /** Get the client IP, validated against FILTER_VALIDATE_IP. */
@@ -300,7 +1089,8 @@ class MagicLoginHandler extends Handler
         return filter_var($_SERVER['REMOTE_ADDR'] ?? '', FILTER_VALIDATE_IP) ?: '0.0.0.0';
     }
 
-    private function emailLink($user, string $token, $context, $request, int $expiryMinutes): void
+    /** Returns true only if the email was actually handed off to the mailer without error. */
+    private function emailLink($user, string $token, $context, $request, int $expiryMinutes): bool
     {
         try {
             $magicUrl = $request->getDispatcher()->url(
@@ -335,19 +1125,25 @@ class MagicLoginHandler extends Handler
                     'expiryMinutes' => $expiryMinutes,
                 ]);
             Mail::send($mailable);
+            return true;
         } catch (\Throwable $e) {
             error_log('[magicLogin] link email failed: ' . $e->getMessage());
+            return false;
         }
     }
 
     /**
-     * For non-logged-in users, CSRF must be present. For already-authenticated
-     * users (e.g., confirming on behalf of themselves), skip it — they already
-     * hold a valid session which mitigates CSRF.
+     * CSRF must be present unconditionally, regardless of login state.
+     * Skipping the check for already-logged-in requesters would allow a
+     * login-CSRF attack: an attacker who owns a valid token for their own
+     * account hosts a page that auto-submits POST /magicLogin/login with
+     * that token; a logged-in victim's browser would send it with valid
+     * cookies and no CSRF check, silently switching the victim's session
+     * into the attacker's account.
      */
     private function validateCsrf($request): bool
     {
-        return Validation::isLoggedIn() ? true : $request->checkCSRF();
+        return $request->checkCSRF();
     }
 
     private function registerAssets(TemplateManager $templateMgr, $request): void
@@ -361,5 +1157,37 @@ class MagicLoginHandler extends Handler
     private function plugin()
     {
         return Registry::get('plugin');
+    }
+
+    /** JSON response helper for the WebAuthn API-style endpoints. */
+    private function jsonResponse(array $data, int $statusCode = 200): void
+    {
+        http_response_code($statusCode);
+        header('Content-Type: application/json');
+        header('Cache-Control: no-store');
+        echo json_encode($data);
+    }
+
+    /**
+     * WebAuthn RP ID — must be the site's hostname (no scheme/port/path),
+     * and must be this exact host or a registrable parent domain of it (the
+     * spec's "effective domain" rule). Using the request's own host keeps
+     * this correct across every install without a settings field.
+     */
+    private function rpId($request): string
+    {
+        $host = parse_url($request->getBaseUrl(), PHP_URL_HOST);
+        return $host ?: ($_SERVER['HTTP_HOST'] ?? 'localhost');
+    }
+
+    /** WebAuthn expects clientData.origin to be an exact scheme+host(+port) match. */
+    private function origin($request): string
+    {
+        $baseUrl = $request->getBaseUrl();
+        $parts = parse_url($baseUrl);
+        $scheme = $parts['scheme'] ?? 'https';
+        $host = $parts['host'] ?? $this->rpId($request);
+        $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+        return "{$scheme}://{$host}{$port}";
     }
 }

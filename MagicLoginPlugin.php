@@ -23,8 +23,20 @@ use PKP\linkAction\request\AjaxModal;
 use PKP\plugins\GenericPlugin;
 use PKP\plugins\Hook;
 
+require_once(dirname(__FILE__) . '/WebAuthnCredentialsTableMigration.php');
+
 class MagicLoginPlugin extends GenericPlugin
 {
+    /**
+     * Plugin setting (per-context) holding a JSON-encoded, capped, newest-first
+     * list of recent magic-login events for the "Recent activity" panel shown
+     * in Settings. Purely for admin visibility — never read by any security
+     * decision, so a lost update under concurrent writes is a cosmetic
+     * (not a security) issue.
+     */
+    public const RECENT_ATTEMPTS_SETTING = 'magicLoginRecentAttempts';
+    public const RECENT_ATTEMPTS_MAX     = 20;
+
     public function register($category, $path, $mainContextId = null)
     {
         $success = parent::register($category, $path, $mainContextId);
@@ -43,6 +55,12 @@ class MagicLoginPlugin extends GenericPlugin
 
         Hook::add('LoadHandler',           [$this, 'setupHandler']);
         Hook::add('TemplateManager::display', [$this, 'addLoginLink']);
+        // The profile Password tab is fetched as an AJAX fragment
+        // (controllers/tab/user/ProfileTabHandler::changePassword() calls
+        // Form::fetch(), never TemplateManager::display()), so this must hook
+        // 'TemplateManager::fetch', not 'TemplateManager::display' — the
+        // latter never fires for this template and silently no-ops.
+        Hook::add('TemplateManager::fetch', [$this, 'addTotpAccountLink']);
         Hook::add('Mailer::Mailables',     [$this, 'addMailable']);
 
         // Ensure the email template is installed for the current context.
@@ -86,6 +104,14 @@ class MagicLoginPlugin extends GenericPlugin
     }
 
     /**
+     * @copydoc Plugin::getInstallMigration()
+     */
+    public function getInstallMigration()
+    {
+        return new WebAuthnCredentialsTableMigration();
+    }
+
+    /**
      * Install the MAGIC_LOGIN_LINK email template the first time this plugin
      * is activated on a context that does not yet have it.
      */
@@ -115,14 +141,29 @@ class MagicLoginPlugin extends GenericPlugin
 
     // ── DB migration ─────────────────────────────────────────────────────────
 
+    /** Site-level plugin setting flag recording that migrateVersionRecord() has already run. */
+    private const SETTING_VERSION_RECORD_MIGRATED = 'versionRecordMigrated';
+
     /**
      * v1.0.0 shipped with <application>ojs2</application> in version.xml,
      * causing OJS to record product='ojs2' in the versions table instead of
      * the correct 'magicLogin'.  Rename the row so version tracking and the
      * plugin list work correctly on existing installations.
+     *
+     * This is a one-time fix-up: once it has run (successfully or not, so a
+     * transient failure doesn't retry forever either) it is gated behind a
+     * persisted site-level setting so it does not run again on every
+     * subsequent page load site-wide.
      */
     private function migrateVersionRecord(): void
     {
+        // Site-level (context null) since the versions table itself is site-wide.
+        // plugin_settings.context_id has a FK to journals(journal_id), which has
+        // no row for id 0 — only NULL (site-wide) or a real journal id are valid.
+        if ($this->getSetting(null, self::SETTING_VERSION_RECORD_MIGRATED)) {
+            return;
+        }
+
         try {
             $alreadyCorrect = DB::table('versions')
                 ->where('product_type', 'plugins.generic')
@@ -138,6 +179,8 @@ class MagicLoginPlugin extends GenericPlugin
             }
         } catch (\Throwable $e) {
             error_log('[magicLogin] migrateVersionRecord failed: ' . $e->getMessage());
+        } finally {
+            $this->updateSetting(null, self::SETTING_VERSION_RECORD_MIGRATED, true, 'bool');
         }
     }
 
@@ -169,25 +212,55 @@ class MagicLoginPlugin extends GenericPlugin
     }
 
     /**
-     * Smarty output filter: inject the magic-login button into the rendered
-     * sign-in form. Theme-agnostic; no template edits required.
+     * Smarty output filter: inject sign-in alternative links (magic link,
+     * TOTP, passkey) into the rendered sign-in form. Theme-agnostic — no
+     * template edits required on the default theme OR any custom theme,
+     * whether or not that theme happens to have its own hardcoded link for
+     * one of these (each is checked and skipped independently, so a theme
+     * that already renders its own magic-link button still gets the TOTP
+     * and passkey links added automatically, and vice versa).
      */
     public function injectLoginButton(string $output, $templateMgr): string
     {
-        // Skip if a theme already rendered the link, or we already injected.
-        if (str_contains($output, 'magic-login-inject') || str_contains($output, 'magicLogin/request')) {
-            return $output;
-        }
         $request = Application::get()->getRequest();
         $context = $request->getContext();
         if (!$context || !$this->getSetting($context->getId(), 'enabled')) {
             return $output;
         }
-        $url   = $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'request');
-        $label = htmlspecialchars((string) __('plugins.generic.magicLogin.login.button'), ENT_QUOTES);
-        $block = '<div class="magic-login-inject" style="margin:1rem 0 0;padding-top:1rem;border-top:1px solid rgba(0,0,0,.08);text-align:center;">'
-               . '<a href="' . htmlspecialchars($url, ENT_QUOTES) . '" class="magic-login-inject__link" style="display:inline-block;font-weight:600;text-decoration:underline;">'
-               . $label . '</a></div>';
+        if (str_contains($output, 'magic-login-inject')) {
+            return $output; // already injected this pass
+        }
+
+        $links = [];
+        if (!str_contains($output, 'magicLogin/request') && !str_contains($output, "op='request'") && !str_contains($output, 'op="request"')) {
+            $links[] = [
+                'url' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'request'),
+                'label' => __('plugins.generic.magicLogin.login.button'),
+            ];
+        }
+        if (!str_contains($output, 'magicLogin/totp') && !str_contains($output, "op='totp'") && !str_contains($output, 'op="totp"')) {
+            $links[] = [
+                'url' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totp'),
+                'label' => __('plugins.generic.magicLogin.request.useTotp'),
+            ];
+        }
+        if (!str_contains($output, 'magicLogin/webauthnLogin') && !str_contains($output, "op='webauthnLogin'") && !str_contains($output, 'op="webauthnLogin"')) {
+            $links[] = [
+                'url' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnLogin'),
+                'label' => __('plugins.generic.magicLogin.request.usePasskey'),
+            ];
+        }
+        if (!$links) {
+            return $output;
+        }
+
+        $anchors = array_map(
+            static fn ($l) => '<a href="' . htmlspecialchars($l['url'], ENT_QUOTES) . '" class="magic-login-inject__link" style="display:inline-block;font-weight:600;text-decoration:underline;">'
+                . htmlspecialchars($l['label'], ENT_QUOTES) . '</a>',
+            $links
+        );
+        $block = '<div class="magic-login-inject" style="margin:1rem 0 0;padding-top:1rem;border-top:1px solid rgba(0,0,0,.08);text-align:center;display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;">'
+               . implode('', $anchors) . '</div>';
 
         // Preferred: insert just before the closing </form> of the sign-in form.
         $pattern = '/(<form\b[^>]*action="[^"]*\/login\/signIn[^"]*"[^>]*>.*?)(<\/form>)/is';
@@ -195,6 +268,53 @@ class MagicLoginPlugin extends GenericPlugin
             return preg_replace($pattern, '$1' . $block . '$2', $output, 1);
         }
         // Fallback: after the first closing form tag on the page.
+        $pos = stripos($output, '</form>');
+        if ($pos !== false) {
+            return substr($output, 0, $pos + 7) . $block . substr($output, $pos + 7);
+        }
+        return $output;
+    }
+
+    /**
+     * Best-effort injection of a "Manage two-factor sign-in" link into the
+     * logged-in user's own Profile › Password tab, so TOTP setup is
+     * discoverable without needing a theme edit — same technique as
+     * injectLoginButton(). If a theme's changePassword.tpl override doesn't
+     * end in a `</form>` tag, this simply no-ops (the page is still directly
+     * reachable at magicLogin/totpSetup; see README).
+     */
+    public function addTotpAccountLink(string $hookName, array $args): bool
+    {
+        // 'user/changePassword.tpl' is the actual template the Profile ›
+        // Password tab renders (there is no 'userProfile.tpl' in OJS 3.5 —
+        // the previous check matched nothing and this injector never fired).
+        $template = $args[1];
+        if (!str_contains($template, 'user/changePassword.tpl')) {
+            return Hook::CONTINUE;
+        }
+        $request = Application::get()->getRequest();
+        $context = $request->getContext();
+        if (!$context || !$this->getSetting($context->getId(), 'enabled')) {
+            return Hook::CONTINUE;
+        }
+        /** @var \APP\template\TemplateManager $templateMgr */
+        $templateMgr = $args[0];
+        $templateMgr->registerFilter('output', [$this, 'injectTotpAccountLink']);
+        return Hook::CONTINUE;
+    }
+
+    /** Smarty output filter: inject the TOTP account-settings link into the profile page. */
+    public function injectTotpAccountLink(string $output, $templateMgr): string
+    {
+        if (str_contains($output, 'magic-login-totp-inject') || str_contains($output, 'magicLogin/totpSetup')) {
+            return $output;
+        }
+        $request = Application::get()->getRequest();
+        $url     = $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totpSetup');
+        $label   = htmlspecialchars((string) __('plugins.generic.magicLogin.totpSetup.profileLink'), ENT_QUOTES);
+        $block   = '<div class="magic-login-totp-inject" style="margin:1rem 0;padding:1rem;border-top:1px solid rgba(0,0,0,.08);">'
+                 . '<a href="' . htmlspecialchars($url, ENT_QUOTES) . '">' . $label . '</a></div>';
+
         $pos = stripos($output, '</form>');
         if ($pos !== false) {
             return substr($output, 0, $pos + 7) . $block . substr($output, $pos + 7);

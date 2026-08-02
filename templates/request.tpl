@@ -37,6 +37,10 @@
 
         <div class="magic-login-switch">
           <a href="{url page='login'}">← {translate key="plugins.generic.magicLogin.request.back"}</a>
+          &nbsp;&middot;&nbsp;
+          <a href="{url page='magicLogin' op='totp'}">{translate key="plugins.generic.magicLogin.request.useTotp"}</a>
+          &nbsp;&middot;&nbsp;
+          <a href="{url page='magicLogin' op='webauthnLogin'}">{translate key="plugins.generic.magicLogin.request.usePasskey"}</a>
         </div>
 
       {/if}
