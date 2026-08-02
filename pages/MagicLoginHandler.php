@@ -35,6 +35,8 @@ use APP\handler\Handler;
 use APP\plugins\generic\magicLogin\classes\SessionService;
 use APP\plugins\generic\magicLogin\classes\TokenService;
 use APP\plugins\generic\magicLogin\classes\TotpAccountService;
+use APP\plugins\generic\magicLogin\classes\webauthn\WebAuthnCeremony;
+use APP\plugins\generic\magicLogin\classes\webauthn\WebAuthnCredentialService;
 use APP\plugins\generic\magicLogin\mailables\MagicLoginLink;
 use APP\plugins\generic\magicLogin\MagicLoginPlugin;
 use APP\template\TemplateManager;
@@ -70,6 +72,20 @@ class MagicLoginHandler extends Handler
     private const TOTP_IDENTIFIER_MAX_LEN = 254;
     /** 6-digit authenticator code. */
     private const TOTP_CODE_PATTERN = '/^\d{6}$/';
+
+    // WebAuthn (passkey) sign-in — same per-IP/per-account dual-limit
+    // posture as TOTP, since options/verify are also unauthenticated
+    // endpoints an attacker could otherwise hammer.
+    private const RL_WEBAUTHN_IP_MAX      = 10;
+    private const RL_WEBAUTHN_IP_WIN      = 300;
+    private const RL_WEBAUTHN_ACCOUNT_MAX = 8;
+    private const RL_WEBAUTHN_ACCOUNT_WIN = 900;
+    /** Registered credentials per account — a generous ceiling, not a real limit. */
+    private const WEBAUTHN_MAX_CREDENTIALS_PER_USER = 10;
+    /** Pending challenge TTL — long enough for a user to complete a biometric/PIN prompt. */
+    private const WEBAUTHN_CHALLENGE_TTL_SEC = 120;
+    private const WEBAUTHN_SESSION_REG_KEY = 'magicLoginWebauthnRegChallenge';
+    private const WEBAUTHN_SESSION_LOGIN_KEY = 'magicLoginWebauthnLoginChallenge';
 
     // Minimum wall-clock duration (seconds) the email-lookup branch of /send
     // must take before responding, so a matched email (DB writes + a
@@ -296,6 +312,27 @@ class MagicLoginHandler extends Handler
         $templateMgr->display($this->plugin()->getTemplateResource('totp.tpl'));
     }
 
+    /** GET: the "sign in with a passkey" page. */
+    public function webauthnLogin($args, $request): void
+    {
+        if (Validation::isLoggedIn()) {
+            $request->redirect(null, 'dashboard');
+        }
+        $this->plugin()->ensureEnabled($request);
+
+        $templateMgr = TemplateManager::getManager($request);
+        $this->registerAssets($templateMgr, $request);
+        $templateMgr->assign([
+            'webauthnLoginOptionsUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnLoginOptions'),
+            'webauthnLoginVerifyUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnLoginVerify'),
+        ]);
+        $templateMgr->addJavaScript(
+            'magicLoginWebauthn',
+            $request->getBaseUrl() . '/' . $this->plugin()->getPluginPath() . '/js/webauthn.js'
+        );
+        $templateMgr->display($this->plugin()->getTemplateResource('webauthnLogin.tpl'));
+    }
+
     /**
      * POST: verify a TOTP code and, if it matches an enabled account, sign in.
      * Same neutral-error posture as the magic-link flow: a wrong identifier,
@@ -435,6 +472,284 @@ class MagicLoginHandler extends Handler
         $this->renderTotpSetup($request, $user, null, __('plugins.generic.magicLogin.totpSetup.disabled'));
     }
 
+    // ── WebAuthn (passkey): self-service registration (logged-in user only) ──
+
+    /**
+     * GET: PublicKeyCredentialCreationOptions for registering a new passkey
+     * on the current account. The challenge is stored server-side in the
+     * session (never trust a challenge the client claims to have received)
+     * keyed to this user, single-use, short TTL.
+     */
+    public function webauthnRegisterOptions($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        $service = new WebAuthnCredentialService();
+
+        if ($service->countForUser($user->getId()) >= self::WEBAUTHN_MAX_CREDENTIALS_PER_USER) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.webauthn.error.tooMany')], 400);
+            return;
+        }
+
+        $challenge = random_bytes(32);
+        $request->getSession()->put(self::WEBAUTHN_SESSION_REG_KEY, [
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'userId' => $user->getId(),
+            'expires' => time() + self::WEBAUTHN_CHALLENGE_TTL_SEC,
+        ]);
+
+        $existing = $service->listForUser($user->getId());
+        $excludeCredentials = array_map(static fn ($row) => [
+            'type' => 'public-key',
+            'id' => $row->credential_id,
+        ], $existing);
+
+        $this->jsonResponse([
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'rp' => ['name' => (string) ($request->getContext() ? $request->getContext()->getLocalizedData('name') : 'OJS'), 'id' => $this->rpId($request)],
+            'user' => [
+                'id' => WebAuthnCeremony::b64urlEncode((string) $user->getId()),
+                'name' => $user->getUsername(),
+                'displayName' => (string) $user->getFullName(),
+            ],
+            'pubKeyCredParams' => [
+                ['type' => 'public-key', 'alg' => -7],
+                ['type' => 'public-key', 'alg' => -257],
+            ],
+            'timeout' => self::WEBAUTHN_CHALLENGE_TTL_SEC * 1000,
+            'attestation' => 'none',
+            'excludeCredentials' => $excludeCredentials,
+            'authenticatorSelection' => ['userVerification' => 'preferred'],
+        ]);
+    }
+
+    /** POST: verify a registration ceremony response and store the new credential. */
+    public function webauthnRegisterVerify($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $this->jsonResponse(['error' => __('form.csrfInvalid')], 403);
+            return;
+        }
+
+        $pending = $request->getSession()->get(self::WEBAUTHN_SESSION_REG_KEY);
+        if (!is_array($pending) || (int) ($pending['expires'] ?? 0) < time() || (int) ($pending['userId'] ?? 0) !== (int) $user->getId()) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.webauthn.error.expired')], 400);
+            return;
+        }
+
+        $credential = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($credential)) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        try {
+            $result = WebAuthnCeremony::verifyRegistration($credential, (string) $pending['challenge'], $this->origin($request), $this->rpId($request));
+        } catch (\Throwable $e) {
+            error_log('[magicLogin] WEBAUTHN_REGISTER_FAIL user_id=' . $user->getId() . ' reason=' . $e->getMessage());
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.webauthn.error.registerFailed')], 400);
+            return;
+        }
+
+        $request->getSession()->forget(self::WEBAUTHN_SESSION_REG_KEY);
+
+        $service = new WebAuthnCredentialService();
+        if ($service->findByCredentialId($result['credentialId'])) {
+            // Same authenticator registered twice (e.g. a double-submitted
+            // request) — treat as success rather than a confusing duplicate-key error.
+            $this->jsonResponse(['ok' => true]);
+            return;
+        }
+
+        $nickname = trim((string) $request->getUserVar('nickname'));
+        $service->store(
+            $user->getId(),
+            $result['credentialId'],
+            $result['publicKeyPem'],
+            $result['alg'],
+            $result['transports'],
+            $result['aaguid'],
+            $nickname !== '' ? mb_substr($nickname, 0, 191) : null
+        );
+
+        error_log('[magicLogin] WEBAUTHN_REGISTERED user_id=' . $user->getId());
+        $this->jsonResponse(['ok' => true]);
+    }
+
+    /** POST: remove a registered passkey. Requires password re-entry, same posture as totpDisable(). */
+    public function webauthnDelete($args, $request): void
+    {
+        $user = $this->requireLoggedInUser($request);
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $request->redirect(null, 'magicLogin', 'totpSetup');
+        }
+
+        $ip = $this->clientIp();
+        $credentialRecordId = (int) $request->getUserVar('credentialRecordId');
+        $password = (string) $request->getUserVar('password');
+
+        if (!self::withinKeyedRateLimit('webauthndelete', hash('sha256', (string) $user->getId()), self::RL_TOTP_ACCOUNT_MAX, self::RL_TOTP_ACCOUNT_WIN)) {
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.error.rateLimit'));
+            return;
+        }
+
+        $reason = null;
+        if ($password === '' || !Validation::checkCredentials($user->getUsername(), $password, $reason)) {
+            error_log("[magicLogin] WEBAUTHN_DELETE_FAIL ip={$ip} user_id={$user->getId()} reason=bad_password");
+            $this->renderTotpSetup($request, $user, __('plugins.generic.magicLogin.totpSetup.error.password'));
+            return;
+        }
+
+        $deleted = (new WebAuthnCredentialService())->delete($credentialRecordId, $user->getId());
+        error_log("[magicLogin] WEBAUTHN_DELETED ip={$ip} user_id={$user->getId()} credential_record_id={$credentialRecordId} ok=" . ($deleted ? '1' : '0'));
+        $this->renderTotpSetup($request, $user, $deleted ? null : __('plugins.generic.magicLogin.error.invalid'), $deleted ? __('plugins.generic.magicLogin.webauthn.removed') : null);
+    }
+
+    // ── WebAuthn (passkey): sign-in (unauthenticated) ─────────────────────────
+
+    /**
+     * POST: PublicKeyCredentialRequestOptions for an identifier. Same
+     * neutral-response posture as totpLogin() — an unknown identifier or one
+     * with no registered passkeys gets an empty allowCredentials list rather
+     * than an error, so this cannot be used to enumerate accounts.
+     */
+    public function webauthnLoginOptions($args, $request): void
+    {
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $this->jsonResponse(['error' => __('form.csrfInvalid')], 403);
+            return;
+        }
+        $this->plugin()->ensureEnabled($request);
+
+        $ip = $this->clientIp();
+        $context = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
+
+        if (!self::withinKeyedRateLimit('webauthnip', $ip, self::RL_WEBAUTHN_IP_MAX, self::RL_WEBAUTHN_IP_WIN)) {
+            error_log("[magicLogin] WEBAUTHN_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'WEBAUTHN_RATELIMIT', null, $ip);
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.rateLimit')], 429);
+            return;
+        }
+
+        $identifier = $this->sanitizeTotpIdentifier((string) $request->getUserVar('identifier'));
+        $challenge = random_bytes(32);
+        $allowCredentials = [];
+        $candidateUserId = null;
+
+        if ($identifier !== null) {
+            $accountKey = hash('sha256', strtolower($identifier));
+            if (self::withinKeyedRateLimit('webauthnacct', $accountKey, self::RL_WEBAUTHN_ACCOUNT_MAX, self::RL_WEBAUTHN_ACCOUNT_WIN)) {
+                $user = Repo::user()->getByUsername($identifier, false) ?: Repo::user()->getByEmail($identifier, false);
+                if ($user && !$user->getDisabled()) {
+                    $credentials = (new WebAuthnCredentialService())->listForUser($user->getId());
+                    if ($credentials) {
+                        $candidateUserId = $user->getId();
+                        $allowCredentials = array_map(static fn ($row) => [
+                            'type' => 'public-key',
+                            'id' => $row->credential_id,
+                            'transports' => $row->transports ? json_decode($row->transports, true) : [],
+                        ], $credentials);
+                    }
+                }
+            }
+        }
+
+        $request->getSession()->put(self::WEBAUTHN_SESSION_LOGIN_KEY, [
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'userId' => $candidateUserId,
+            'expires' => time() + self::WEBAUTHN_CHALLENGE_TTL_SEC,
+        ]);
+
+        $this->jsonResponse([
+            'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
+            'rpId' => $this->rpId($request),
+            'timeout' => self::WEBAUTHN_CHALLENGE_TTL_SEC * 1000,
+            'userVerification' => 'preferred',
+            // Always present (even if empty) so the client can distinguish
+            // "no passkeys for this account" from a transport error, without
+            // that distinction ever reaching an unauthenticated attacker
+            // (the array is simply empty in both the unknown-identifier and
+            // rate-limited cases above).
+            'allowCredentials' => $allowCredentials,
+        ]);
+    }
+
+    /** POST: verify an authentication ceremony response and, on success, sign in. */
+    public function webauthnLoginVerify($args, $request): void
+    {
+        if (!$request->isPost() || !$this->validateCsrf($request)) {
+            $this->jsonResponse(['error' => __('form.csrfInvalid')], 403);
+            return;
+        }
+
+        $ip = $this->clientIp();
+        $context = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
+
+        $pending = $request->getSession()->get(self::WEBAUTHN_SESSION_LOGIN_KEY);
+        if (!is_array($pending) || (int) ($pending['expires'] ?? 0) < time() || empty($pending['userId'])) {
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', null, $ip, 'no_pending_challenge');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        $credential = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($credential)) {
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        $user = Repo::user()->get((int) $pending['userId']);
+        $credentialId = (string) ($credential['id'] ?? '');
+        $stored = $credentialId !== '' ? (new WebAuthnCredentialService())->findByCredentialId($credentialId) : null;
+
+        // The credential returned by the browser must belong to the SAME
+        // account this challenge was minted for — prevents a credential ID
+        // swap across two concurrent login attempts from different accounts.
+        if (!$user || $user->getDisabled() || !$stored || (int) $stored->user_id !== (int) $user->getId()) {
+            error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} reason=credential_account_mismatch");
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user ? $user->getId() : null, $ip, 'credential_account_mismatch');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        try {
+            $result = WebAuthnCeremony::verifyAssertion($credential, (string) $pending['challenge'], $this->origin($request), $this->rpId($request), $stored->public_key_pem);
+        } catch (\Throwable $e) {
+            error_log('[magicLogin] WEBAUTHN_FAIL ip=' . $ip . ' user_id=' . $user->getId() . ' reason=' . $e->getMessage());
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user->getId(), $ip, 'verify_failed');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        // Anti-clone signal (spec section 6.1.1): a cloned authenticator
+        // replays an old counter value. Authenticators that don't implement
+        // a counter always report 0 — only enforce strictly-increasing when
+        // the authenticator has ever reported a nonzero count.
+        $service = new WebAuthnCredentialService();
+        if ($stored->sign_count > 0 && $result['signCount'] > 0 && $result['signCount'] <= (int) $stored->sign_count) {
+            error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} user_id={$user->getId()} reason=sign_count_replay");
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user->getId(), $ip, 'sign_count_replay');
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        $request->getSession()->forget(self::WEBAUTHN_SESSION_LOGIN_KEY);
+        $service->updateSignCount((int) $stored->credential_record_id, $result['signCount']);
+
+        if (SessionService::establishSession($user, 'webauthn')) {
+            error_log("[magicLogin] WEBAUTHN_LOGIN_SUCCESS user_id={$user->getId()} ip={$ip}");
+            $this->recordAttempt($contextId, 'WEBAUTHN_LOGIN_SUCCESS', $user->getId(), $ip);
+            $this->jsonResponse(['ok' => true, 'redirect' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'dashboard')]);
+            return;
+        }
+
+        error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} user_id={$user->getId()} reason=session_failed");
+        $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user->getId(), $ip, 'session_failed');
+        $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+    }
+
     /**
      * Render the logged-in user's TOTP settings page. If TOTP is not
      * currently enabled, (re)generates a pending secret so the page always
@@ -477,6 +792,26 @@ class MagicLoginHandler extends Handler
                 $request->getBaseUrl() . '/' . $this->plugin()->getPluginPath() . '/js/qrcode.js'
             );
         }
+
+        $credentials = (new WebAuthnCredentialService())->listForUser($user->getId());
+        $templateMgr->assign([
+            'webauthnCredentials' => array_map(static function ($row) {
+                return [
+                    'id' => (int) $row->credential_record_id,
+                    'nickname' => $row->nickname,
+                    'createdAt' => $row->created_at,
+                    'lastUsedAt' => $row->last_used_at,
+                ];
+            }, $credentials),
+            'webauthnCanAddMore' => count($credentials) < self::WEBAUTHN_MAX_CREDENTIALS_PER_USER,
+            'webauthnRegisterOptionsUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnRegisterOptions'),
+            'webauthnRegisterVerifyUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnRegisterVerify'),
+            'webauthnDeleteUrl' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnDelete'),
+        ]);
+        $templateMgr->addJavaScript(
+            'magicLoginWebauthn',
+            $request->getBaseUrl() . '/' . $this->plugin()->getPluginPath() . '/js/webauthn.js'
+        );
 
         $templateMgr->display($this->plugin()->getTemplateResource('totpSetup.tpl'));
     }
@@ -814,5 +1149,37 @@ class MagicLoginHandler extends Handler
     private function plugin()
     {
         return Registry::get('plugin');
+    }
+
+    /** JSON response helper for the WebAuthn API-style endpoints. */
+    private function jsonResponse(array $data, int $statusCode = 200): void
+    {
+        http_response_code($statusCode);
+        header('Content-Type: application/json');
+        header('Cache-Control: no-store');
+        echo json_encode($data);
+    }
+
+    /**
+     * WebAuthn RP ID — must be the site's hostname (no scheme/port/path),
+     * and must be this exact host or a registrable parent domain of it (the
+     * spec's "effective domain" rule). Using the request's own host keeps
+     * this correct across every install without a settings field.
+     */
+    private function rpId($request): string
+    {
+        $host = parse_url($request->getBaseUrl(), PHP_URL_HOST);
+        return $host ?: ($_SERVER['HTTP_HOST'] ?? 'localhost');
+    }
+
+    /** WebAuthn expects clientData.origin to be an exact scheme+host(+port) match. */
+    private function origin($request): string
+    {
+        $baseUrl = $request->getBaseUrl();
+        $parts = parse_url($baseUrl);
+        $scheme = $parts['scheme'] ?? 'https';
+        $host = $parts['host'] ?? $this->rpId($request);
+        $port = isset($parts['port']) ? ':' . $parts['port'] : '';
+        return "{$scheme}://{$host}{$port}";
     }
 }

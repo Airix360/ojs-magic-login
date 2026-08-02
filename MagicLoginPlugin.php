@@ -23,6 +23,8 @@ use PKP\linkAction\request\AjaxModal;
 use PKP\plugins\GenericPlugin;
 use PKP\plugins\Hook;
 
+require_once(dirname(__FILE__) . '/WebAuthnCredentialsTableMigration.php');
+
 class MagicLoginPlugin extends GenericPlugin
 {
     /**
@@ -99,6 +101,14 @@ class MagicLoginPlugin extends GenericPlugin
     public function getInstallEmailTemplatesFile()
     {
         return $this->getPluginPath() . '/emailTemplates.xml';
+    }
+
+    /**
+     * @copydoc Plugin::getInstallMigration()
+     */
+    public function getInstallMigration()
+    {
+        return new WebAuthnCredentialsTableMigration();
     }
 
     /**

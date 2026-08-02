@@ -225,9 +225,56 @@ Available Smarty variables: `$sendUrl`, `$loginUrl`, `$token`, `$neutralMessage`
 |---------|--------|-------------|
 | 1.1.0 | Released | One-time email links with rate limiting and CSRF protection |
 | 1.2.1 | Released | Automatic, theme-agnostic injection of the sign-in-link button into the login form (no theme edits required); plugin pages ship as a plain single-column default |
-| 2.0.0 | Planned | Passkey / WebAuthn sign-in as a second passwordless method |
+| 1.3.0 | Released | TOTP authenticator-app sign-in as a second alternative method |
+| 2.0.0 | Released | Passkey / WebAuthn sign-in as a third passwordless method |
 
-The session-establishment layer (`classes/SessionService.php`) is already factored to accept a second caller so the passkey implementation does not require structural changes to this release.
+### Passkeys (WebAuthn) — implementation notes
+
+Full W3C WebAuthn Level 2 registration ("attestation") and authentication
+("assertion") ceremonies, hand-implemented on top of PHP's built-in
+`openssl_*` functions — same "no library exists in this install's vendor
+tree" situation as `classes/TotpService.php`'s RFC 6238 implementation, but
+this sits directly in front of a signature check, so the scope and testing
+posture are documented explicitly here rather than just in code comments:
+
+- **What's implemented**: a minimal CBOR decoder (`classes/webauthn/Cbor.php`,
+  only the subset WebAuthn structures use), COSE key → PEM conversion for
+  **ES256** (EC P-256 — every platform authenticator: Touch ID, Windows
+  Hello, Android biometric — and most security keys) and **RS256** (the
+  remaining security keys that only offer RSA), and the full
+  registration/authentication ceremony verification (challenge, origin, RP
+  ID hash, user-present flag, signature) in `classes/webauthn/WebAuthnCeremony.php`.
+  A user can register multiple passkeys (own table,
+  `magic_login_webauthn_credentials`, unlike TOTP's single `user_settings`
+  secret). Anti-clone signing-counter check (spec §6.1.1), with the
+  documented allowance that authenticators reporting a counter of 0 forever
+  (most platform authenticators) don't trigger it.
+- **What's deliberately NOT implemented**: attestation statement signature
+  verification / trust-chain checking (would require bundling X.509 parsing
+  and a FIDO Metadata Service client — no bearing on the actual login
+  security guarantee, which rests entirely on the *assertion* signature at
+  sign-in time, not on verifying the authenticator's manufacturer identity
+  at registration time). Extensions (none are requested).
+- **Testing posture**: `tests/webauthn-format.php` (18 checks) proves the
+  CBOR/COSE/PEM conversion against **real openssl-generated EC and RSA
+  keypairs and real signatures** — not a copied "known-vector" fixture.
+  `tests/webauthn-ceremony.php` (10 checks) builds real
+  `authenticatorData`/`attestationObject`/`clientDataJSON` byte structures
+  exactly as a browser+authenticator would and runs them through the actual
+  registration/assertion verification code, checking both the success path
+  and that tampering with the challenge, origin, RP ID, signature, or
+  signed bytes is rejected. What this test suite **cannot** cover — and
+  what genuinely needs a human with a real device — is an actual browser
+  `navigator.credentials.create()`/`.get()` ceremony completing against a
+  real Touch ID / Windows Hello / security key; that was verified only up
+  to the point where the browser hands off to the platform's native
+  authenticator prompt (confirmed: options endpoints return correct,
+  session-backed, real challenges; CSRF/rate-limiting/session-storage wiring
+  confirmed live; templates render correctly logged-in and logged-out).
+
+The session-establishment layer (`classes/SessionService.php`) was already
+factored to accept a second caller before this release, so wiring passkey
+login into it required no structural changes.
 
 ---
 
