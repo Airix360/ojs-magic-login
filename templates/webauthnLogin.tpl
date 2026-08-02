@@ -10,15 +10,11 @@
 
       <div id="webauthn-login-status" class="magic-login-alert magic-login-alert-err" style="display:none;"></div>
 
-      <form class="magic-login-form" id="webauthnLoginForm" novalidate
+      {* Usernameless: no identifier field. The browser/authenticator lists
+         whichever resident passkeys it holds for this site. *}
+      <form id="webauthnLoginForm" novalidate
         data-options-url="{$webauthnLoginOptionsUrl|escape}"
         data-verify-url="{$webauthnLoginVerifyUrl|escape}">
-        <div class="magic-login-field">
-          <label class="magic-login-label" for="webauthn-identifier">{translate key="plugins.generic.magicLogin.totp.identifierLabel"}</label>
-          <input class="magic-login-input" type="text" name="identifier" id="webauthn-identifier" required
-            autocomplete="username webauthn"
-            placeholder="{translate key="plugins.generic.magicLogin.totp.identifierPlaceholder"}">
-        </div>
         <button class="magic-login-button" type="submit">
           <span>{translate key="plugins.generic.magicLogin.webauthn.login.button"}</span>
           <span>→</span>

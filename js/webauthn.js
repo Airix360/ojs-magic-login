@@ -115,25 +115,28 @@
   }
 
   // ── Sign-in (webauthnLogin.tpl) ────────────────────────────────────────
+  // Usernameless: no identifier is collected. allowCredentials is left
+  // empty so the browser/authenticator lists every resident passkey it
+  // holds for this site; the account is identified server-side from the
+  // credential ID (and cross-checked against the assertion's userHandle).
 
   function initLogin() {
     var form = document.getElementById('webauthnLoginForm');
     if (!form) { return; }
+    var statusEl = document.getElementById('webauthn-login-status');
+    var submitBtn = form.querySelector('button[type="submit"]');
     if (typeof PublicKeyCredential === 'undefined') {
-      setStatus(document.getElementById('webauthn-login-status'), 'Passkeys are not supported in this browser.', true);
-      form.querySelector('button[type="submit"]').disabled = true;
+      setStatus(statusEl, 'Passkeys are not supported in this browser.', true);
+      submitBtn.disabled = true;
       return;
     }
-    var statusEl = document.getElementById('webauthn-login-status');
-    var identifierInput = document.getElementById('webauthn-identifier');
 
     form.addEventListener('submit', function (event) {
       event.preventDefault();
       setStatus(statusEl, '', false);
-      var submitBtn = form.querySelector('button[type="submit"]');
       submitBtn.disabled = true;
 
-      postJson(form.dataset.optionsUrl, { identifier: identifierInput.value }).then(function (res) {
+      postJson(form.dataset.optionsUrl, {}).then(function (res) {
         if (!res.ok) { throw new Error((res.data && res.data.error) || 'Could not start sign-in.'); }
         var options = res.data;
         var publicKey = {
@@ -141,9 +144,7 @@
           rpId: options.rpId,
           timeout: options.timeout,
           userVerification: options.userVerification,
-          allowCredentials: (options.allowCredentials || []).map(function (c) {
-            return { type: c.type, id: b64urlToBuffer(c.id), transports: c.transports };
-          })
+          allowCredentials: []
         };
         return navigator.credentials.get({ publicKey: publicKey });
       }).then(function (credential) {
@@ -153,7 +154,8 @@
           response: {
             clientDataJSON: bufferToB64url(assertionResponse.clientDataJSON),
             authenticatorData: bufferToB64url(assertionResponse.authenticatorData),
-            signature: bufferToB64url(assertionResponse.signature)
+            signature: bufferToB64url(assertionResponse.signature),
+            userHandle: assertionResponse.userHandle ? bufferToB64url(assertionResponse.userHandle) : null
           }
         };
         return postJson(form.dataset.verifyUrl, payload);

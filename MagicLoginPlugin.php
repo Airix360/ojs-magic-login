@@ -212,25 +212,55 @@ class MagicLoginPlugin extends GenericPlugin
     }
 
     /**
-     * Smarty output filter: inject the magic-login button into the rendered
-     * sign-in form. Theme-agnostic; no template edits required.
+     * Smarty output filter: inject sign-in alternative links (magic link,
+     * TOTP, passkey) into the rendered sign-in form. Theme-agnostic — no
+     * template edits required on the default theme OR any custom theme,
+     * whether or not that theme happens to have its own hardcoded link for
+     * one of these (each is checked and skipped independently, so a theme
+     * that already renders its own magic-link button still gets the TOTP
+     * and passkey links added automatically, and vice versa).
      */
     public function injectLoginButton(string $output, $templateMgr): string
     {
-        // Skip if a theme already rendered the link, or we already injected.
-        if (str_contains($output, 'magic-login-inject') || str_contains($output, 'magicLogin/request')) {
-            return $output;
-        }
         $request = Application::get()->getRequest();
         $context = $request->getContext();
         if (!$context || !$this->getSetting($context->getId(), 'enabled')) {
             return $output;
         }
-        $url   = $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'request');
-        $label = htmlspecialchars((string) __('plugins.generic.magicLogin.login.button'), ENT_QUOTES);
-        $block = '<div class="magic-login-inject" style="margin:1rem 0 0;padding-top:1rem;border-top:1px solid rgba(0,0,0,.08);text-align:center;">'
-               . '<a href="' . htmlspecialchars($url, ENT_QUOTES) . '" class="magic-login-inject__link" style="display:inline-block;font-weight:600;text-decoration:underline;">'
-               . $label . '</a></div>';
+        if (str_contains($output, 'magic-login-inject')) {
+            return $output; // already injected this pass
+        }
+
+        $links = [];
+        if (!str_contains($output, 'magicLogin/request') && !str_contains($output, "op='request'") && !str_contains($output, 'op="request"')) {
+            $links[] = [
+                'url' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'request'),
+                'label' => __('plugins.generic.magicLogin.login.button'),
+            ];
+        }
+        if (!str_contains($output, 'magicLogin/totp') && !str_contains($output, "op='totp'") && !str_contains($output, 'op="totp"')) {
+            $links[] = [
+                'url' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'totp'),
+                'label' => __('plugins.generic.magicLogin.request.useTotp'),
+            ];
+        }
+        if (!str_contains($output, 'magicLogin/webauthnLogin') && !str_contains($output, "op='webauthnLogin'") && !str_contains($output, 'op="webauthnLogin"')) {
+            $links[] = [
+                'url' => $request->getDispatcher()->url($request, Application::ROUTE_PAGE, null, 'magicLogin', 'webauthnLogin'),
+                'label' => __('plugins.generic.magicLogin.request.usePasskey'),
+            ];
+        }
+        if (!$links) {
+            return $output;
+        }
+
+        $anchors = array_map(
+            static fn ($l) => '<a href="' . htmlspecialchars($l['url'], ENT_QUOTES) . '" class="magic-login-inject__link" style="display:inline-block;font-weight:600;text-decoration:underline;">'
+                . htmlspecialchars($l['label'], ENT_QUOTES) . '</a>',
+            $links
+        );
+        $block = '<div class="magic-login-inject" style="margin:1rem 0 0;padding-top:1rem;border-top:1px solid rgba(0,0,0,.08);text-align:center;display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;">'
+               . implode('', $anchors) . '</div>';
 
         // Preferred: insert just before the closing </form> of the sign-in form.
         $pattern = '/(<form\b[^>]*action="[^"]*\/login\/signIn[^"]*"[^>]*>.*?)(<\/form>)/is';

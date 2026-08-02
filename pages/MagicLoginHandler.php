@@ -518,7 +518,18 @@ class MagicLoginHandler extends Handler
             'timeout' => self::WEBAUTHN_CHALLENGE_TTL_SEC * 1000,
             'attestation' => 'none',
             'excludeCredentials' => $excludeCredentials,
-            'authenticatorSelection' => ['userVerification' => 'preferred'],
+            // residentKey 'required' stores the credential ON the
+            // authenticator/device (a "discoverable credential"), which is
+            // what lets sign-in skip asking for a username — the browser
+            // can list a device's resident passkeys for this RP without
+            // being told in advance who's signing in. requireResidentKey is
+            // the older (Level 1) form of the same request, included for
+            // browsers that don't yet read residentKey.
+            'authenticatorSelection' => [
+                'userVerification' => 'preferred',
+                'residentKey' => 'required',
+                'requireResidentKey' => true,
+            ],
         ]);
     }
 
@@ -608,10 +619,14 @@ class MagicLoginHandler extends Handler
     // ── WebAuthn (passkey): sign-in (unauthenticated) ─────────────────────────
 
     /**
-     * POST: PublicKeyCredentialRequestOptions for an identifier. Same
-     * neutral-response posture as totpLogin() — an unknown identifier or one
-     * with no registered passkeys gets an empty allowCredentials list rather
-     * than an error, so this cannot be used to enumerate accounts.
+     * POST: PublicKeyCredentialRequestOptions for a usernameless (discoverable
+     * credential) sign-in — no identifier is collected. `allowCredentials` is
+     * intentionally left empty so the browser/authenticator surfaces every
+     * resident passkey it holds for this RP; the response's `userHandle`
+     * (the account's user ID, embedded at registration time) is how
+     * webauthnLoginVerify() learns who is signing in — see
+     * WEBAUTHN_MAX_CREDENTIALS_PER_USER's registration path, which requests
+     * `residentKey: 'required'` for exactly this reason.
      */
     public function webauthnLoginOptions($args, $request): void
     {
@@ -632,32 +647,9 @@ class MagicLoginHandler extends Handler
             return;
         }
 
-        $identifier = $this->sanitizeTotpIdentifier((string) $request->getUserVar('identifier'));
         $challenge = random_bytes(32);
-        $allowCredentials = [];
-        $candidateUserId = null;
-
-        if ($identifier !== null) {
-            $accountKey = hash('sha256', strtolower($identifier));
-            if (self::withinKeyedRateLimit('webauthnacct', $accountKey, self::RL_WEBAUTHN_ACCOUNT_MAX, self::RL_WEBAUTHN_ACCOUNT_WIN)) {
-                $user = Repo::user()->getByUsername($identifier, false) ?: Repo::user()->getByEmail($identifier, false);
-                if ($user && !$user->getDisabled()) {
-                    $credentials = (new WebAuthnCredentialService())->listForUser($user->getId());
-                    if ($credentials) {
-                        $candidateUserId = $user->getId();
-                        $allowCredentials = array_map(static fn ($row) => [
-                            'type' => 'public-key',
-                            'id' => $row->credential_id,
-                            'transports' => $row->transports ? json_decode($row->transports, true) : [],
-                        ], $credentials);
-                    }
-                }
-            }
-        }
-
         $request->getSession()->put(self::WEBAUTHN_SESSION_LOGIN_KEY, [
             'challenge' => WebAuthnCeremony::b64urlEncode($challenge),
-            'userId' => $candidateUserId,
             'expires' => time() + self::WEBAUTHN_CHALLENGE_TTL_SEC,
         ]);
 
@@ -666,12 +658,8 @@ class MagicLoginHandler extends Handler
             'rpId' => $this->rpId($request),
             'timeout' => self::WEBAUTHN_CHALLENGE_TTL_SEC * 1000,
             'userVerification' => 'preferred',
-            // Always present (even if empty) so the client can distinguish
-            // "no passkeys for this account" from a transport error, without
-            // that distinction ever reaching an unauthenticated attacker
-            // (the array is simply empty in both the unknown-identifier and
-            // rate-limited cases above).
-            'allowCredentials' => $allowCredentials,
+            // Empty on purpose — see method docblock.
+            'allowCredentials' => [],
         ]);
     }
 
@@ -688,7 +676,7 @@ class MagicLoginHandler extends Handler
         $contextId = $context ? $context->getId() : 0;
 
         $pending = $request->getSession()->get(self::WEBAUTHN_SESSION_LOGIN_KEY);
-        if (!is_array($pending) || (int) ($pending['expires'] ?? 0) < time() || empty($pending['userId'])) {
+        if (!is_array($pending) || (int) ($pending['expires'] ?? 0) < time()) {
             $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', null, $ip, 'no_pending_challenge');
             $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
             return;
@@ -700,17 +688,37 @@ class MagicLoginHandler extends Handler
             return;
         }
 
-        $user = Repo::user()->get((int) $pending['userId']);
+        // Usernameless flow: the account is identified entirely by which
+        // stored credential's ID the authenticator returned — there is no
+        // pre-known candidate user to cross-check against (unlike the old
+        // identifier-first flow). userHandle (set to the user ID at
+        // registration) is a second, independent confirmation of the same
+        // fact, not the primary lookup — the credential row itself already
+        // pins the account.
         $credentialId = (string) ($credential['id'] ?? '');
         $stored = $credentialId !== '' ? (new WebAuthnCredentialService())->findByCredentialId($credentialId) : null;
+        $userHandle = isset($credential['response']['userHandle'])
+            ? WebAuthnCeremony::b64urlDecode((string) $credential['response']['userHandle'])
+            : null;
 
-        // The credential returned by the browser must belong to the SAME
-        // account this challenge was minted for — prevents a credential ID
-        // swap across two concurrent login attempts from different accounts.
-        if (!$user || $user->getDisabled() || !$stored || (int) $stored->user_id !== (int) $user->getId()) {
-            error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} reason=credential_account_mismatch");
-            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user ? $user->getId() : null, $ip, 'credential_account_mismatch');
+        $user = $stored ? Repo::user()->get((int) $stored->user_id) : null;
+
+        if (!$user || $user->getDisabled() || !$stored
+            || ($userHandle !== null && $userHandle !== (string) $user->getId())
+        ) {
+            error_log("[magicLogin] WEBAUTHN_FAIL ip={$ip} reason=unknown_credential");
+            $this->recordAttempt($contextId, 'WEBAUTHN_FAIL', $user ? $user->getId() : null, $ip, 'unknown_credential');
             $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.invalid')], 400);
+            return;
+        }
+
+        // Per-account rate limit, checked now that the credential has told
+        // us which account this is (the usernameless flow has no earlier
+        // point to check this against).
+        if (!self::withinKeyedRateLimit('webauthnacct', hash('sha256', (string) $user->getId()), self::RL_WEBAUTHN_ACCOUNT_MAX, self::RL_WEBAUTHN_ACCOUNT_WIN)) {
+            error_log("[magicLogin] WEBAUTHN_RATELIMIT ip={$ip} scope=account");
+            $this->recordAttempt($contextId, 'WEBAUTHN_RATELIMIT', $user->getId(), $ip);
+            $this->jsonResponse(['error' => __('plugins.generic.magicLogin.error.rateLimit')], 429);
             return;
         }
 
