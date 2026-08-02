@@ -341,7 +341,7 @@ msgid "plugins.generic.magicLogin.webauthn.login.heading"
 msgstr "Sign in with a passkey"
 
 msgid "plugins.generic.magicLogin.webauthn.login.help"
-msgstr "Enter your username or email, then use your device's built-in security to sign in."
+msgstr "Use your device's built-in security — Touch ID, Face ID, Windows Hello, or a security key — to sign in. No username needed."
 
 msgid "plugins.generic.magicLogin.webauthn.login.button"
 msgstr "Continue"
