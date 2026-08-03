@@ -11,12 +11,16 @@
  *
  * Security model summary
  * ─────────────────────
- *  • CSRF enforced on every mutating request via PKP's checkCSRF().
+ *  • CSRF enforced unconditionally on every mutating request via
+ *    PKP's checkCSRF() -- including requests from an already-logged-in
+ *    session, which is what prevents login-CSRF (an attacker's own
+ *    valid token being auto-submitted by a logged-in victim's browser).
  *  • Token format validated (regex) before any DB access.
  *  • Per-IP sliding-window rate limits: /send (5/10 min), /login (10/5 min).
  *  • Per-account minimum interval enforced in TokenService (independent of IP).
  *  • Neutral /send response prevents user-account enumeration.
- *  • Token consumed before session creation (single-use guarantee).
+ *  • Token verified and consumed atomically (single DB transaction) before
+ *    session creation (single-use guarantee, race-safe under concurrency).
  *  • Session ID regenerated on login (anti session-fixation, SessionService).
  *  • Cache-Control: no-store + Referrer-Policy: no-referrer on /confirm (token
  *    in query string must not be cached or sent in referer).
@@ -31,6 +35,7 @@ use APP\handler\Handler;
 use APP\plugins\generic\magicLogin\classes\SessionService;
 use APP\plugins\generic\magicLogin\classes\TokenService;
 use APP\plugins\generic\magicLogin\mailables\MagicLoginLink;
+use APP\plugins\generic\magicLogin\MagicLoginPlugin;
 use APP\template\TemplateManager;
 use Illuminate\Support\Facades\Mail;
 use PKP\core\Registry;
@@ -51,6 +56,12 @@ class MagicLoginHandler extends Handler
     private const RL_SEND_WIN  = 600; // 10 minutes
     private const RL_LOGIN_MAX = 10;  // max /login POST attempts per IP per window
     private const RL_LOGIN_WIN = 300; // 5 minutes
+
+    // Minimum wall-clock duration (seconds) the email-lookup branch of /send
+    // must take before responding, so a matched email (DB writes + a
+    // synchronous mail send) and an unmatched one (near-instant) are not
+    // distinguishable by response timing.
+    private const SEND_MIN_DURATION_SEC = 0.35;
 
     public function authorize($request, &$args, $roleAssignments)
     {
@@ -88,30 +99,48 @@ class MagicLoginHandler extends Handler
         $plugin = $this->plugin();
         $plugin->ensureEnabled($request);
 
-        $ip = $this->clientIp();
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
 
         // Per-IP rate limit prevents one IP from flooding many accounts.
         if (!self::withinRateLimit('send', $ip, self::RL_SEND_MAX, self::RL_SEND_WIN)) {
             error_log("[magicLogin] SEND_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'SEND_RATELIMIT', null, $ip);
             // Show the same neutral message so the IP can't confirm the limit was hit.
             $this->showNeutralSentPage($request, $plugin);
             return;
         }
 
-        $context = $request->getContext();
-        $email   = $this->sanitizeEmail((string) $request->getUserVar('email'));
+        $email = $this->sanitizeEmail((string) $request->getUserVar('email'));
+
+        // Timed from here so the matched and unmatched branches below can be
+        // normalized to the same minimum wall-clock duration (timing
+        // side-channel mitigation — see SEND_MIN_DURATION_SEC).
+        $branchStart = microtime(true);
 
         if ($email !== null) {
             $user = Repo::user()->getByEmail($email, false); // active users only
             if ($user && !$user->getDisabled()) {
-                $ttl   = $plugin->ttlSeconds($context->getId());
-                $token = (new TokenService())->issue($user, $ttl, $plugin->minIntervalSeconds($context->getId()));
+                $ttl   = $plugin->ttlSeconds($contextId);
+                $token = (new TokenService())->issue($user, $ttl, $plugin->minIntervalSeconds($contextId));
                 if ($token) {
-                    $this->emailLink($user, $token, $context, $request, (int) round($ttl / 60));
-                    error_log("[magicLogin] LINK_SENT user_id={$user->getId()} ip={$ip}");
+                    if ($this->emailLink($user, $token, $context, $request, (int) round($ttl / 60))) {
+                        error_log("[magicLogin] LINK_SENT user_id={$user->getId()} ip={$ip}");
+                        $this->recordAttempt($contextId, 'LINK_SENT', $user->getId(), $ip);
+                    } else {
+                        error_log("[magicLogin] LINK_SEND_FAILED user_id={$user->getId()} ip={$ip}");
+                        $this->recordAttempt($contextId, 'LINK_SEND_FAILED', $user->getId(), $ip);
+                    }
                 }
+            } else {
+                $this->performDummySendWork();
             }
+        } else {
+            $this->performDummySendWork();
         }
+
+        $this->normalizeSendTiming($branchStart);
 
         // Always identical response — no account enumeration.
         $this->showNeutralSentPage($request, $plugin);
@@ -165,9 +194,12 @@ class MagicLoginHandler extends Handler
     }
 
     /**
-     * POST: verify the token, consume it, then establish the session.
-     * Token consumption happens before session creation so a failure in session
-     * setup does not leave a live token that could be replayed.
+     * POST: atomically verify + consume the token, then establish the session.
+     * Verification and consumption happen in a single DB transaction (see
+     * TokenService::verifyAndConsume()) so concurrent requests presenting the
+     * same token cannot both succeed, and consumption happens before session
+     * creation so a failure in session setup does not leave a live token that
+     * could be replayed.
      */
     public function login($args, $request): void
     {
@@ -176,11 +208,14 @@ class MagicLoginHandler extends Handler
         }
         $this->plugin()->ensureEnabled($request);
 
-        $ip = $this->clientIp();
+        $ip        = $this->clientIp();
+        $context   = $request->getContext();
+        $contextId = $context ? $context->getId() : 0;
 
         // Per-IP rate limit on verify attempts.
         if (!self::withinRateLimit('login', $ip, self::RL_LOGIN_MAX, self::RL_LOGIN_WIN)) {
             error_log("[magicLogin] LOGIN_RATELIMIT ip={$ip}");
+            $this->recordAttempt($contextId, 'LOGIN_RATELIMIT', null, $ip);
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.rateLimit'));
             return;
         }
@@ -189,34 +224,70 @@ class MagicLoginHandler extends Handler
 
         if ($token === null) {
             error_log("[magicLogin] LOGIN_FAIL ip={$ip} reason=malformed_token");
+            $this->recordAttempt($contextId, 'LOGIN_FAIL', null, $ip, 'malformed_token');
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.invalid'));
             return;
         }
 
         $service = new TokenService();
-        $user    = $service->verify($token);
+        // Verify and consume atomically (single transaction): guarantees a
+        // token can be turned into a live session at most once, even under
+        // concurrent requests presenting the same token.
+        $user = $service->verifyAndConsume($token);
 
         if (!$user) {
             error_log("[magicLogin] LOGIN_FAIL ip={$ip} reason=invalid_or_expired_token");
+            $this->recordAttempt($contextId, 'LOGIN_FAIL', null, $ip, 'invalid_or_expired_token');
             $this->showConfirmError($request, __('plugins.generic.magicLogin.error.invalid'));
             return;
         }
 
-        // Consume BEFORE session creation — token is dead whether or not the
-        // session succeeds, so there is no replay window.
-        $service->consume($user);
-
         if (SessionService::establishSession($user, 'magicLogin')) {
             error_log("[magicLogin] LOGIN_SUCCESS user_id={$user->getId()} ip={$ip}");
+            $this->recordAttempt($contextId, 'LOGIN_SUCCESS', $user->getId(), $ip);
             $request->redirect(null, 'dashboard');
         }
 
         // Session establishment returned false (account disabled between token issue and use).
         error_log("[magicLogin] LOGIN_FAIL ip={$ip} user_id={$user->getId()} reason=session_failed");
+        $this->recordAttempt($contextId, 'LOGIN_FAIL', $user->getId(), $ip, 'session_failed');
         $request->redirect(null, 'magicLogin', 'request');
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
+
+    /**
+     * Append an event to the capped, per-context "recent activity" list shown
+     * in the plugin's Settings panel (admin-facing visibility only).
+     *
+     * This is a best-effort log, not a security control: it is read-modify-
+     * write against a single plugin setting row rather than an append-only
+     * table, so a lost update under concurrent requests is a cosmetic
+     * (missing) log entry, never a false one and never something a security
+     * decision depends on. Failures here must never break the login flow.
+     */
+    private function recordAttempt(int $contextId, string $event, ?int $userId, string $ip, ?string $reason = null): void
+    {
+        try {
+            $plugin = $this->plugin();
+            $raw    = (string) $plugin->getSetting($contextId, MagicLoginPlugin::RECENT_ATTEMPTS_SETTING);
+            $events = $raw !== '' ? json_decode($raw, true) : [];
+            if (!is_array($events)) {
+                $events = [];
+            }
+            array_unshift($events, [
+                'ts'      => time(),
+                'event'   => $event,
+                'user_id' => $userId,
+                'ip'      => $ip,
+                'reason'  => $reason,
+            ]);
+            $events = array_slice($events, 0, MagicLoginPlugin::RECENT_ATTEMPTS_MAX);
+            $plugin->updateSetting($contextId, MagicLoginPlugin::RECENT_ATTEMPTS_SETTING, json_encode($events), 'string');
+        } catch (\Throwable $e) {
+            error_log('[magicLogin] recordAttempt failed (non-fatal): ' . $e->getMessage());
+        }
+    }
 
     private function showNeutralSentPage($request, $plugin): void
     {
@@ -232,6 +303,33 @@ class MagicLoginHandler extends Handler
         $this->registerAssets($templateMgr, $request);
         $templateMgr->assign('error', $message);
         $templateMgr->display($this->plugin()->getTemplateResource('confirm.tpl'));
+    }
+
+    /**
+     * Equivalent-cost dummy work for the "no match" branch of /send: performs
+     * the same shape of work as TokenService::issue() (random byte generation
+     * + hashing) without touching the database, so a profiler/timer can't
+     * trivially distinguish "no account" from "account found, doing real work".
+     */
+    private function performDummySendWork(): void
+    {
+        $dummySelector = bin2hex(random_bytes(16));
+        $dummyVerifier = rtrim(strtr(base64_encode(random_bytes(32)), '+/', '-_'), '=');
+        hash('sha256', $dummyVerifier . $dummySelector);
+    }
+
+    /**
+     * Pads the elapsed time of the /send email-lookup branch up to
+     * SEND_MIN_DURATION_SEC, so neither branch returns fast enough to leak
+     * whether the submitted email matched an account.
+     */
+    private function normalizeSendTiming(float $branchStart): void
+    {
+        $elapsed   = microtime(true) - $branchStart;
+        $remaining = self::SEND_MIN_DURATION_SEC - $elapsed;
+        if ($remaining > 0) {
+            usleep((int) round($remaining * 1_000_000));
+        }
     }
 
     /**
@@ -265,6 +363,11 @@ class MagicLoginHandler extends Handler
      * File-based sliding-window per-IP rate limiter.
      * Stores per-action hit timestamps in cache/_rl/ml_{action}_{ip}.json.
      * Returns true if the request is within the limit, false if it is exceeded.
+     *
+     * The entire read-modify-write cycle (read hits, purge stale ones, count,
+     * decide, append, write) is held under a single exclusive flock so two
+     * concurrent requests from the same IP cannot both read the same stale
+     * hit-count and both pass the check.
      */
     private static function withinRateLimit(string $action, string $ip, int $max, int $windowSecs): bool
     {
@@ -277,21 +380,39 @@ class MagicLoginHandler extends Handler
         $safeIp     = preg_replace('/[^0-9a-fA-F.:]/i', '_', $ip);
         $file       = "{$dir}/ml_{$safeAction}_{$safeIp}.json";
 
-        $now  = time();
-        $hits = [];
-        if (is_file($file)) {
-            $raw  = @file_get_contents($file);
-            $hits = is_string($raw) ? (json_decode($raw, true) ?: []) : [];
+        $handle = @fopen($file, 'c+');
+        if ($handle === false) {
+            // Cannot open the counter file at all — fail open rather than
+            // block all logins on a filesystem hiccup.
+            return true;
         }
-        // Purge hits that have slid out of the window.
-        $hits = array_values(array_filter($hits, static fn($t) => is_int($t) && $t > $now - $windowSecs));
 
-        if (count($hits) >= $max) {
-            return false;
+        try {
+            if (!flock($handle, LOCK_EX)) {
+                return true;
+            }
+
+            $now = time();
+            $raw = stream_get_contents($handle);
+            $hits = is_string($raw) && $raw !== '' ? (json_decode($raw, true) ?: []) : [];
+            // Purge hits that have slid out of the window.
+            $hits = array_values(array_filter($hits, static fn($t) => is_int($t) && $t > $now - $windowSecs));
+
+            if (count($hits) >= $max) {
+                flock($handle, LOCK_UN);
+                return false;
+            }
+            $hits[] = $now;
+
+            ftruncate($handle, 0);
+            rewind($handle);
+            fwrite($handle, json_encode($hits));
+            fflush($handle);
+            flock($handle, LOCK_UN);
+            return true;
+        } finally {
+            fclose($handle);
         }
-        $hits[] = $now;
-        @file_put_contents($file, json_encode($hits), LOCK_EX);
-        return true;
     }
 
     /** Get the client IP, validated against FILTER_VALIDATE_IP. */
@@ -300,7 +421,8 @@ class MagicLoginHandler extends Handler
         return filter_var($_SERVER['REMOTE_ADDR'] ?? '', FILTER_VALIDATE_IP) ?: '0.0.0.0';
     }
 
-    private function emailLink($user, string $token, $context, $request, int $expiryMinutes): void
+    /** Returns true only if the email was actually handed off to the mailer without error. */
+    private function emailLink($user, string $token, $context, $request, int $expiryMinutes): bool
     {
         try {
             $magicUrl = $request->getDispatcher()->url(
@@ -335,19 +457,25 @@ class MagicLoginHandler extends Handler
                     'expiryMinutes' => $expiryMinutes,
                 ]);
             Mail::send($mailable);
+            return true;
         } catch (\Throwable $e) {
             error_log('[magicLogin] link email failed: ' . $e->getMessage());
+            return false;
         }
     }
 
     /**
-     * For non-logged-in users, CSRF must be present. For already-authenticated
-     * users (e.g., confirming on behalf of themselves), skip it — they already
-     * hold a valid session which mitigates CSRF.
+     * CSRF must be present unconditionally, regardless of login state.
+     * Skipping the check for already-logged-in requesters would allow a
+     * login-CSRF attack: an attacker who owns a valid token for their own
+     * account hosts a page that auto-submits POST /magicLogin/login with
+     * that token; a logged-in victim's browser would send it with valid
+     * cookies and no CSRF check, silently switching the victim's session
+     * into the attacker's account.
      */
     private function validateCsrf($request): bool
     {
-        return Validation::isLoggedIn() ? true : $request->checkCSRF();
+        return $request->checkCSRF();
     }
 
     private function registerAssets(TemplateManager $templateMgr, $request): void

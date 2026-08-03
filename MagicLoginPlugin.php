@@ -25,6 +25,16 @@ use PKP\plugins\Hook;
 
 class MagicLoginPlugin extends GenericPlugin
 {
+    /**
+     * Plugin setting (per-context) holding a JSON-encoded, capped, newest-first
+     * list of recent magic-login events for the "Recent activity" panel shown
+     * in Settings. Purely for admin visibility — never read by any security
+     * decision, so a lost update under concurrent writes is a cosmetic
+     * (not a security) issue.
+     */
+    public const RECENT_ATTEMPTS_SETTING = 'magicLoginRecentAttempts';
+    public const RECENT_ATTEMPTS_MAX     = 20;
+
     public function register($category, $path, $mainContextId = null)
     {
         $success = parent::register($category, $path, $mainContextId);
@@ -115,14 +125,29 @@ class MagicLoginPlugin extends GenericPlugin
 
     // ── DB migration ─────────────────────────────────────────────────────────
 
+    /** Site-level plugin setting flag recording that migrateVersionRecord() has already run. */
+    private const SETTING_VERSION_RECORD_MIGRATED = 'versionRecordMigrated';
+
     /**
      * v1.0.0 shipped with <application>ojs2</application> in version.xml,
      * causing OJS to record product='ojs2' in the versions table instead of
      * the correct 'magicLogin'.  Rename the row so version tracking and the
      * plugin list work correctly on existing installations.
+     *
+     * This is a one-time fix-up: once it has run (successfully or not, so a
+     * transient failure doesn't retry forever either) it is gated behind a
+     * persisted site-level setting so it does not run again on every
+     * subsequent page load site-wide.
      */
     private function migrateVersionRecord(): void
     {
+        // Site-level (context null) since the versions table itself is site-wide.
+        // plugin_settings.context_id has a FK to journals(journal_id), which has
+        // no row for id 0 — only NULL (site-wide) or a real journal id are valid.
+        if ($this->getSetting(null, self::SETTING_VERSION_RECORD_MIGRATED)) {
+            return;
+        }
+
         try {
             $alreadyCorrect = DB::table('versions')
                 ->where('product_type', 'plugins.generic')
@@ -138,6 +163,8 @@ class MagicLoginPlugin extends GenericPlugin
             }
         } catch (\Throwable $e) {
             error_log('[magicLogin] migrateVersionRecord failed: ' . $e->getMessage());
+        } finally {
+            $this->updateSetting(null, self::SETTING_VERSION_RECORD_MIGRATED, true, 'bool');
         }
     }
 
